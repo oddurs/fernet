@@ -16,6 +16,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 fernet-fs-path = { path = "../crates/fernet-path" }
 fernet-fs-formats = { path = "../crates/fernet-formats" }
+fernet-fs-store = { path = "../crates/fernet-store" }
 serde_json = "1"
 
 # Kept out of the main workspace: it needs nightly and its own lockfile.
@@ -45,6 +46,13 @@ bench = false
 [[bin]]
 name = "yaml_parse"
 path = "fuzz_targets/yaml_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "segment_scan"
+path = "fuzz_targets/segment_scan.rs"
 test = false
 doc = false
 bench = false
