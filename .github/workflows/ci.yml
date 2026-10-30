@@ -91,7 +91,13 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install macFUSE (headers and pkg-config file; no mounting in CI)
+        run: |
+          brew install pkgconf
+          brew install --cask macfuse
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --locked
       - run: cargo test --workspace --lib --bins --locked
+      - name: Build without the mount
+        run: cargo build -p fernet-fs --no-default-features --locked

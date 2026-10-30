@@ -14,7 +14,7 @@ workspace = true
 
 [dependencies]
 thiserror = "2"
-toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
+toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
 saphyr-parser = "0.3"
 
 [dev-dependencies]

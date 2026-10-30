@@ -374,3 +374,38 @@ at capture.
 `FERNET_REQUIRE_FUSE=1`, which turns the mount tests' "FUSE unavailable" skip
 into a failure. Locally, without FUSE, they skip. The tests mount through the
 real `fernet mount --daemon` binary and unmount with `fusermount3 -u`.
+
+## 36. Type-preserving writes, per format
+
+**Decision.** `SetScalar` strips exactly one trailing `\n`, then:
+- **Strings** accept any text, re-quoted in the source's style when the text
+  allows it: JSON is always double-quoted; TOML literal strings stay literal
+  unless the text holds a quote or newline, multi-line strings stay multi-line,
+  and everything else becomes a basic string; YAML plain stays plain only when
+  the text reads back as the same string (one line, no indicators, not `true` or
+  `123`), single-quoted stays single-quoted, and anything else becomes
+  double-quoted with escapes for non-printable characters.
+- **Other types** must parse as the same type in that format's grammar: TOML's
+  integers (with `_`, `0x`, `0o`, `0b`), floats and date-times are validated by
+  `toml_edit`; YAML uses the 1.2 core schema. JSON has one number type, so
+  integers and floats are interchangeable there. Elsewhere `2` into a float field
+  is `EINVAL`.
+- Every splice is checked by re-parsing: the result must parse and the value
+  at the pointer must be exactly the new text with the same type. Otherwise the
+  write fails and nothing changes.
+
+## 37. Inserts and removes
+
+**Decision.**
+- **JSON** inserts are byte splices that copy the last sibling's layout: same
+  line or one per line, its indentation, its `:` spacing, and a trailing comma if
+  it has one. Arrays only grow at the end (the new name must be the next index).
+  New text that is a JSON number, `true`, `false` or `null` keeps that type;
+  anything else is a string. Removes take one adjoining comma; removing the only
+  member leaves `{}`/`[]`.
+- **TOML** inserts and removes go through `toml_edit`'s format-preserving
+  document, which keeps every untouched item byte-for-byte. Two small layout
+  fixes keep arrays and inline tables tidy. `mkdir` in a table creates a
+  `[parent.key]` table; in an inline table, `{}`.
+- **YAML** is scalars-only, as the brief says. Values behind aliases or carrying
+  anchors or tags, and block scalars, are read-only (`EOPNOTSUPP`).

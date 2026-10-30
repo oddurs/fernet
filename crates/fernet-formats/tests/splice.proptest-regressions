@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 09b3f557b647d368b4399c12bf34bcb7e1add27f4a0de252be394403e1063b66 # shrinks to root = [("a", Map([("a", Str(""))]))], indent = 0, pick = 0, seed = 2382800755027841967, s = "\r"
+cc cd3a720f3a978866b83cec75402c353ea4f41e8ed361ba93272893157817f168 # shrinks to root = [("k", List([Str(""), Str("")])), ("a", Str(""))], pick = 0, seed = 8456270287436943697, s = "\n"
+cc 8b209d466e52a1b4603a385cd191d5b7812a6c35bf03767ec48956211209cec0 # shrinks to root = [("a_0", Str("")), ("b", Map([("a", Map([("a", Str(""))]))])), ("a", Str(""))], pick = 0, seed = 7959902371348663, s = "\n"

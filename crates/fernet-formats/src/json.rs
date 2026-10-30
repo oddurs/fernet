@@ -1,8 +1,11 @@
 //! JSON, with JSONC comments and trailing commas: a small span-tracking
 //! recursive-descent parser.
 
+use std::fmt::Write as _;
+
 use crate::{
-    Builder, Caps, Driver, DriverError, Edit, MAX_DEPTH, NodeId, NodeKind, ScalarType, Tree,
+    Builder, Caps, Driver, DriverError, Edit, MAX_DEPTH, NewValue, Node, NodeId, NodeKind,
+    ScalarType, Tree,
 };
 
 /// The JSON driver. Accepts `//` and `/* */` comments and trailing commas
@@ -61,13 +64,232 @@ impl Driver for Json {
         Ok(p.b.finish(root))
     }
 
-    fn splice(&self, _: &[u8], _: &[String], _: Edit) -> Result<Vec<u8>, DriverError> {
-        Err(DriverError::Unsupported("json writes arrive in v0.4"))
+    fn splice(&self, src: &[u8], ptr: &[String], edit: Edit) -> Result<Vec<u8>, DriverError> {
+        let tree = self.parse(src)?;
+        let id = tree.get(ptr).ok_or(DriverError::NotFound)?;
+        match edit {
+            Edit::SetScalar(text) => {
+                let node = tree.node(id);
+                let NodeKind::Scalar(ty) = node.kind else {
+                    return Err(DriverError::WrongKind("not a value"));
+                };
+                let text = crate::strip_newline(&text);
+                let literal = match ty {
+                    ScalarType::String | ScalarType::Text => quote(text),
+                    // JSON has one number type: integers and floats interchange.
+                    ScalarType::Integer | ScalarType::Float if is_number(text) => text.to_owned(),
+                    ScalarType::Bool if text == "true" || text == "false" => text.to_owned(),
+                    ScalarType::Null if text == "null" => text.to_owned(),
+                    _ => {
+                        return Err(DriverError::InvalidValue(format!(
+                            "{text:?} isn't a json {}",
+                            crate::type_name(ty)
+                        )));
+                    }
+                };
+                let out = crate::replace(src, node.value_span.clone(), &literal);
+                let want = match ty {
+                    ScalarType::Integer | ScalarType::Float => number_type(text),
+                    _ => ty,
+                };
+                crate::check_scalar(self, &out, ptr, want, text)?;
+                Ok(out)
+            }
+            Edit::Insert { key, value } => {
+                let out = insert(src, &tree, id, &key, &value)?;
+                self.parse(&out)
+                    .map_err(|_| DriverError::Unsupported("the edit would produce invalid json"))?;
+                Ok(out)
+            }
+            Edit::Remove => {
+                let out = remove(src, &tree, ptr)?;
+                self.parse(&out)
+                    .map_err(|_| DriverError::Unsupported("the edit would produce invalid json"))?;
+                Ok(out)
+            }
+        }
     }
 
     fn capabilities(&self) -> Caps {
-        Caps::READ_ONLY
+        Caps::FULL
     }
+}
+
+/// A JSON string literal for `text`: escapes quotes, backslashes and control
+/// characters, and nothing else.
+fn quote(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if c < ' ' => drop(write!(out, "\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// True if `text` is exactly a JSON number.
+fn is_number(text: &str) -> bool {
+    let mut p = Parser {
+        src: text,
+        pos: 0,
+        depth: 0,
+        b: Builder::default(),
+    };
+    matches!(text.as_bytes().first(), Some(b'-' | b'0'..=b'9'))
+        && p.number().is_ok()
+        && p.pos == text.len()
+}
+
+fn number_type(text: &str) -> ScalarType {
+    if text.contains(['.', 'e', 'E']) {
+        ScalarType::Float
+    } else {
+        ScalarType::Integer
+    }
+}
+
+/// The literal for a new value: numbers, booleans and null as written,
+/// anything else as a string.
+fn new_literal(value: &NewValue) -> String {
+    match value {
+        NewValue::EmptyObject => "{}".into(),
+        NewValue::EmptyArray => "[]".into(),
+        NewValue::Text(t) => {
+            let t = crate::strip_newline(t);
+            if is_number(t) || matches!(t, "true" | "false" | "null") {
+                t.to_owned()
+            } else {
+                quote(t)
+            }
+        }
+    }
+}
+
+/// Inserts `key` into the container `id`, matching the last sibling's layout:
+/// same line or one per line, its indentation, its `:` spacing, and a trailing
+/// comma if it has one.
+fn insert(
+    src: &[u8],
+    tree: &Tree,
+    id: NodeId,
+    key: &str,
+    value: &NewValue,
+) -> Result<Vec<u8>, DriverError> {
+    let (s, _) = crate::text(src)?;
+    let node = tree.node(id);
+    let object = match node.kind {
+        NodeKind::Object => true,
+        NodeKind::Array => false,
+        NodeKind::Scalar(_) => return Err(DriverError::WrongKind("not an object or array")),
+    };
+    if object && tree.child(id, key).is_some() {
+        return Err(DriverError::Exists);
+    }
+    if !object && key != node.children.len().to_string() {
+        return Err(DriverError::InvalidValue(format!(
+            "arrays grow at the end: the next index is {}",
+            node.children.len()
+        )));
+    }
+    let literal = new_literal(value);
+    let open = node.value_span.start;
+    let close = node.value_span.end - 1;
+    let Some(last) = node
+        .children
+        .iter()
+        .map(|&(_, c)| tree.node(c))
+        .max_by_key(|n| n.span.end)
+    else {
+        let member = if object {
+            format!("{}: {literal}", quote(key))
+        } else {
+            literal
+        };
+        return Ok(crate::replace(src, open + 1..close, &member));
+    };
+    let first = node
+        .children
+        .iter()
+        .map(|&(_, c)| tree.node(c))
+        .min_by_key(|n| n.span.start)
+        .unwrap_or(last);
+    let multiline = s[open..first.span.start].contains('\n');
+    let indent = if multiline {
+        let line_start = s[..last.span.start].rfind('\n').map_or(0, |i| i + 1);
+        s[line_start..last.span.start].to_owned()
+    } else {
+        String::new()
+    };
+    let sep = match &last.key_span {
+        Some(k) if object => s[k.end..last.value_span.start].to_owned(),
+        _ => ": ".to_owned(),
+    };
+    let member = if object {
+        format!("{}{sep}{literal}", quote(key))
+    } else {
+        literal
+    };
+    let gap = if multiline {
+        format!("\n{indent}")
+    } else {
+        " ".to_owned()
+    };
+    // A trailing comma after the last member (JSONC) stays trailing.
+    let after = &s[last.span.end..close];
+    let trimmed = after.trim_start();
+    if trimmed.starts_with(',') {
+        let comma = last.span.end + (after.len() - trimmed.len()) + 1;
+        return Ok(crate::replace(
+            src,
+            comma..comma,
+            &format!("{gap}{member},"),
+        ));
+    }
+    Ok(crate::replace(
+        src,
+        last.span.end..last.span.end,
+        &format!(",{gap}{member}"),
+    ))
+}
+
+/// Removes the node at `ptr` with one adjoining comma.
+fn remove(src: &[u8], tree: &Tree, ptr: &[String]) -> Result<Vec<u8>, DriverError> {
+    let (_, parent_ptr) = ptr
+        .split_last()
+        .ok_or(DriverError::Unsupported("can't remove the whole document"))?;
+    let parent = tree.get(parent_ptr).ok_or(DriverError::NotFound)?;
+    let target = tree.get(ptr).ok_or(DriverError::NotFound)?;
+    let mut siblings: Vec<&Node> = tree
+        .node(parent)
+        .children
+        .iter()
+        .map(|&(_, c)| tree.node(c))
+        .collect();
+    siblings.sort_by_key(|n| n.span.start);
+    let t = tree.node(target);
+    let i = siblings
+        .iter()
+        .position(|n| std::ptr::eq(*n, t))
+        .ok_or(DriverError::NotFound)?;
+    let range = match (siblings.get(i.wrapping_sub(1)), siblings.get(i + 1)) {
+        (_, Some(next)) => t.span.start..next.span.start,
+        (Some(prev), None) => prev.span.end..t.span.end,
+        (None, None) => {
+            let p = tree.node(parent);
+            p.value_span.start + 1..p.value_span.end - 1
+        }
+    };
+    Ok(crate::replace(src, range, ""))
 }
 
 struct Parser<'a> {

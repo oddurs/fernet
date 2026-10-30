@@ -4,6 +4,8 @@
 //! to their anchored node; `<<` merge keys are ordinary keys; mapping and
 //! sequence keys are left out; scalar types follow the YAML 1.2 core schema.
 
+use std::fmt::Write as _;
+
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -37,12 +39,62 @@ impl Driver for Yaml {
         Build::new(s).run()
     }
 
-    fn splice(&self, _: &[u8], _: &[String], _: Edit) -> Result<Vec<u8>, DriverError> {
-        Err(DriverError::Unsupported("yaml writes arrive in v0.4"))
+    fn splice(&self, src: &[u8], ptr: &[String], edit: Edit) -> Result<Vec<u8>, DriverError> {
+        let Edit::SetScalar(text) = edit else {
+            return Err(DriverError::Unsupported(
+                "yaml supports writing values only, not adding or removing keys",
+            ));
+        };
+        let tree = self.parse(src)?;
+        let (s, _) = crate::text(src)?;
+        // Nodes reached through an alias, or carrying an anchor, are shared:
+        // writing one would change every alias.
+        let mut refs = vec![0u32; tree.nodes.len()];
+        for n in &tree.nodes {
+            for (_, c) in &n.children {
+                refs[c.0] += 1;
+            }
+        }
+        let mut at = tree.root;
+        for key in ptr {
+            at = tree.child(at, key).ok_or(DriverError::NotFound)?;
+            if refs[at.0] > 1 {
+                return Err(DriverError::Unsupported(
+                    "values behind yaml aliases are read-only",
+                ));
+            }
+        }
+        let node = tree.node(at);
+        let NodeKind::Scalar(ty) = node.kind else {
+            return Err(DriverError::WrongKind("not a value"));
+        };
+        let old = &s[node.value_span.clone()];
+        if old.starts_with(['|', '>']) {
+            return Err(DriverError::Unsupported("yaml block scalars are read-only"));
+        }
+        if has_properties(s, node.value_span.start) {
+            return Err(DriverError::Unsupported(
+                "yaml values with anchors or tags are read-only",
+            ));
+        }
+        let text = crate::strip_newline(&text);
+        let literal = match ty {
+            ScalarType::String | ScalarType::Text => string_literal(old, text),
+            _ if core_schema(text) == ty => text.to_owned(),
+            _ => {
+                return Err(DriverError::InvalidValue(format!(
+                    "{text:?} isn't a yaml {}",
+                    crate::type_name(ty)
+                )));
+            }
+        };
+        let out = crate::replace(src, node.value_span.clone(), &literal);
+        crate::check_scalar(self, &out, ptr, ty, text)?;
+        Ok(out)
     }
 
     fn capabilities(&self) -> Caps {
-        Caps::READ_ONLY
+        Caps::SCALARS
     }
 }
 
@@ -330,6 +382,75 @@ impl<'s> Build<'s> {
         };
         Ok(self.b.finish(root))
     }
+}
+
+/// True if the token just before `at` (on the same line) is an `&anchor` or
+/// `!tag` property.
+fn has_properties(s: &str, at: usize) -> bool {
+    let before = s[..at].trim_end_matches([' ', '\t']);
+    let token_start = before
+        .rfind([' ', '\t', '\n', ':', '-', '[', '{', ','])
+        .map_or(0, |i| i + 1);
+    before[token_start..].starts_with(['&', '!'])
+}
+
+/// True if `text` can be written as a plain scalar and read back as the same
+/// string: one line, no surrounding spaces, no indicators, and not a word the
+/// core schema would read as another type. Flow characters are refused too, so
+/// it's safe inside `[…]` and `{…}`.
+fn plain_ok(text: &str) -> bool {
+    !text.is_empty()
+        && core_schema(text) == ScalarType::String
+        && text.trim() == text
+        && !text.chars().any(|c| {
+            c.is_control()
+                || !yaml_printable(c)
+                || matches!(c, ',' | '[' | ']' | '{' | '}' | '#' | '"' | '\'' | '\\')
+        })
+        && !text.starts_with(['-', '?', ':', '&', '*', '!', '|', '>', '%', '@', '`'])
+        && !text.contains(": ")
+        && !text.ends_with(':')
+}
+
+fn double_quoted(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\0' => out.push_str("\\0"),
+            c if !yaml_printable(c) => match u32::from(c) {
+                n @ 0..=0xffff => drop(write!(out, "\\u{n:04x}")),
+                n => drop(write!(out, "\\U{n:08x}")),
+            },
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// YAML's printable set (spec 5.1).
+fn yaml_printable(c: char) -> bool {
+    matches!(u32::from(c), 0x9 | 0xA | 0xD | 0x20..=0x7E | 0x85 | 0xA0..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10_FFFF)
+}
+
+/// A scalar literal for `text` in the style of `old`: plain stays plain and
+/// single-quoted stays single-quoted when the text allows; otherwise
+/// double-quoted, which can carry anything.
+fn string_literal(old: &str, text: &str) -> String {
+    let simple = text.chars().all(|c| yaml_printable(c) && !c.is_control());
+    if old.starts_with('\'') && simple {
+        return format!("'{}'", text.replace('\'', "''"));
+    }
+    if !old.starts_with(['"', '\'']) && plain_ok(text) {
+        return text.to_owned();
+    }
+    double_quoted(text)
 }
 
 /// YAML 1.2 core-schema resolution for untagged plain scalars.

@@ -77,6 +77,7 @@ enum Command {
     /// Rebuild the index from the log.
     Reindex,
     /// Mount dir at mountpoint (read-only), in the foreground unless --daemon.
+    #[cfg(feature = "mount")]
     Mount {
         /// The backing directory.
         dir: PathBuf,
@@ -354,6 +355,7 @@ fn run(cli: &Cli) -> Result<u8, Failure> {
             let n = ctx.need_store()?.reindex().map_err(|e| store_failure(&e))?;
             writeln!(out, "reindexed {n} records")?;
         }
+        #[cfg(feature = "mount")]
         Command::Mount {
             dir,
             mountpoint,
@@ -447,6 +449,7 @@ fn start_watch(cli: &Cli, dir: Option<&Path>) -> Result<u8, Failure> {
 }
 
 /// Whether something is mounted at `path`: its device differs from its parent's.
+#[cfg(feature = "mount")]
 fn is_mounted(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     let parent = path.parent().unwrap_or(path);
@@ -456,6 +459,7 @@ fn is_mounted(path: &Path) -> bool {
     }
 }
 
+#[cfg(feature = "mount")]
 fn mount(dir: &Path, mountpoint: &Path, daemon: bool) -> Result<u8, Failure> {
     let mountpoint = std::fs::canonicalize(mountpoint).map_err(|e| {
         Failure::new(

@@ -1,9 +1,12 @@
 //! TOML, via `toml_edit`'s span-preserving parser (`docs/DECISIONS.md`, entry 12).
 
-use toml_edit::{Item, Table, Value};
+use std::fmt::Write as _;
+
+use toml_edit::{ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
 
 use crate::{
-    Builder, Caps, Driver, DriverError, Edit, MAX_DEPTH, NodeId, NodeKind, ScalarType, Tree,
+    Builder, Caps, Driver, DriverError, Edit, MAX_DEPTH, NewValue, NodeId, NodeKind, ScalarType,
+    Tree,
 };
 
 /// The TOML driver.
@@ -64,12 +67,293 @@ impl Driver for Toml {
         Ok(w.b.finish(root))
     }
 
-    fn splice(&self, _: &[u8], _: &[String], _: Edit) -> Result<Vec<u8>, DriverError> {
-        Err(DriverError::Unsupported("toml writes arrive in v0.4"))
+    fn splice(&self, src: &[u8], ptr: &[String], edit: Edit) -> Result<Vec<u8>, DriverError> {
+        let tree = self.parse(src)?;
+        let id = tree.get(ptr).ok_or(DriverError::NotFound)?;
+        let out = match edit {
+            Edit::SetScalar(text) => {
+                let node = tree.node(id);
+                let NodeKind::Scalar(ty) = node.kind else {
+                    return Err(DriverError::WrongKind("not a value"));
+                };
+                let text = crate::strip_newline(&text);
+                let (s, _) = crate::text(src)?;
+                let literal = match ty {
+                    ScalarType::String | ScalarType::Text => {
+                        string_literal(&s[node.value_span.clone()], text)
+                    }
+                    _ if value_type(text) == Some(ty) => text.to_owned(),
+                    _ => {
+                        return Err(DriverError::InvalidValue(format!(
+                            "{text:?} isn't a toml {}",
+                            crate::type_name(ty)
+                        )));
+                    }
+                };
+                let out = crate::replace(src, node.value_span.clone(), &literal);
+                crate::check_scalar(self, &out, ptr, ty, text)?;
+                return Ok(out);
+            }
+            Edit::Insert { key, value } => edit_doc(src, ptr, |slot| insert(slot, &key, &value))?,
+            Edit::Remove => {
+                let (last, parent) = ptr
+                    .split_last()
+                    .ok_or(DriverError::Unsupported("can't remove the whole document"))?;
+                edit_doc(src, parent, |slot| remove(slot, last))?
+            }
+        };
+        self.parse(&out)
+            .map_err(|_| DriverError::Unsupported("the edit would produce invalid toml"))?;
+        Ok(out)
     }
 
     fn capabilities(&self) -> Caps {
-        Caps::READ_ONLY
+        Caps::FULL
+    }
+}
+
+/// The type `text` has as a TOML value, if it is one.
+fn value_type(text: &str) -> Option<ScalarType> {
+    let doc: DocumentMut = format!("v = {text}").parse().ok()?;
+    let ty = match doc.get("v")?.as_value()? {
+        Value::String(_) => ScalarType::String,
+        Value::Integer(_) => ScalarType::Integer,
+        Value::Float(_) => ScalarType::Float,
+        Value::Boolean(_) => ScalarType::Bool,
+        Value::Datetime(_) => ScalarType::Datetime,
+        Value::Array(_) | Value::InlineTable(_) => return None,
+    };
+    Some(ty)
+}
+
+/// Escapes for TOML basic strings. Newlines stay raw when `multiline`.
+fn escape_basic(text: &str, multiline: bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' if multiline => out.push('\n'),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if c.is_control() => drop(write!(out, "\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// A string literal for `text` in the style of `old` (the existing literal):
+/// literal strings stay literal when they can, multi-line stays multi-line,
+/// and everything else becomes a basic string.
+fn string_literal(old: &str, text: &str) -> String {
+    let plain_chars = !text
+        .chars()
+        .any(|c| c.is_control() && c != '\t' && c != '\n');
+    if old.starts_with("'''") && plain_chars && !text.contains('\'') {
+        let lead = if old.starts_with("'''\n") || text.starts_with('\n') {
+            "\n"
+        } else {
+            ""
+        };
+        return format!("'''{lead}{text}'''");
+    }
+    if old.starts_with("\"\"\"") {
+        let lead = if old.starts_with("\"\"\"\n") {
+            "\n"
+        } else {
+            ""
+        };
+        // A leading newline right after the quotes is trimmed by TOML; escape it.
+        let body = escape_basic(text, true);
+        let body = if lead.is_empty() && body.starts_with('\n') {
+            format!("\\n{}", &body[1..])
+        } else {
+            body
+        };
+        return format!("\"\"\"{lead}{body}\"\"\"");
+    }
+    if old.starts_with('\'') && plain_chars && !text.contains(['\'', '\n']) {
+        return format!("'{text}'");
+    }
+    format!("\"{}\"", escape_basic(text, false))
+}
+
+/// A TOML value for new text: whatever it parses as, else a string.
+fn new_value(text: &str) -> Value {
+    let text = crate::strip_newline(text);
+    let parsed: Option<Value> = format!("v = {text}")
+        .parse::<DocumentMut>()
+        .ok()
+        .and_then(|d| d.get("v").and_then(Item::as_value).cloned());
+    match parsed {
+        Some(mut v) if !matches!(v, Value::String(_)) => {
+            v.decor_mut().clear();
+            v
+        }
+        _ => Value::from(text),
+    }
+}
+
+/// A mutable position in a `toml_edit` document.
+enum Slot<'a> {
+    Table(&'a mut Table),
+    Inline(&'a mut InlineTable),
+    Array(&'a mut toml_edit::Array),
+    Tables(&'a mut ArrayOfTables),
+    Scalar,
+}
+
+fn slot_of_item(item: &mut Item) -> Slot<'_> {
+    match item {
+        Item::Table(t) => Slot::Table(t),
+        Item::ArrayOfTables(a) => Slot::Tables(a),
+        Item::Value(v) => slot_of_value(v),
+        Item::None => Slot::Scalar,
+    }
+}
+
+fn slot_of_value(value: &mut Value) -> Slot<'_> {
+    match value {
+        Value::InlineTable(t) => Slot::Inline(t),
+        Value::Array(a) => Slot::Array(a),
+        _ => Slot::Scalar,
+    }
+}
+
+fn step<'a>(slot: Slot<'a>, key: &str) -> Option<Slot<'a>> {
+    match slot {
+        Slot::Table(t) => t.get_mut(key).map(slot_of_item),
+        Slot::Inline(t) => t.get_mut(key).map(slot_of_value),
+        Slot::Array(a) => a.get_mut(key.parse::<usize>().ok()?).map(slot_of_value),
+        Slot::Tables(a) => a.get_mut(key.parse::<usize>().ok()?).map(Slot::Table),
+        Slot::Scalar => None,
+    }
+}
+
+/// Parses `src` with `toml_edit`, applies `f` at `ptr`, and prints it back.
+/// `toml_edit` keeps every untouched item's formatting.
+fn edit_doc(
+    src: &[u8],
+    ptr: &[String],
+    f: impl FnOnce(Slot<'_>) -> Result<(), DriverError>,
+) -> Result<Vec<u8>, DriverError> {
+    let (s, start) = crate::text(src)?;
+    let mut doc: DocumentMut = s[start..]
+        .parse()
+        .map_err(|_| DriverError::Unsupported("invalid toml"))?;
+    let mut slot = Slot::Table(doc.as_table_mut());
+    for key in ptr {
+        slot = step(slot, key).ok_or(DriverError::NotFound)?;
+    }
+    f(slot)?;
+    let mut out = s.as_bytes()[..start].to_vec();
+    out.extend_from_slice(doc.to_string().as_bytes());
+    Ok(out)
+}
+
+fn next_index(key: &str, len: usize) -> Result<(), DriverError> {
+    if key == len.to_string() {
+        Ok(())
+    } else {
+        Err(DriverError::InvalidValue(format!(
+            "arrays grow at the end: the next index is {len}"
+        )))
+    }
+}
+
+fn insert(slot: Slot<'_>, key: &str, value: &NewValue) -> Result<(), DriverError> {
+    let as_value = || match value {
+        NewValue::EmptyObject => Value::InlineTable(InlineTable::new()),
+        NewValue::EmptyArray => Value::Array(toml_edit::Array::new()),
+        NewValue::Text(t) => new_value(t),
+    };
+    match slot {
+        Slot::Table(t) => {
+            if t.contains_key(key) {
+                return Err(DriverError::Exists);
+            }
+            let item = match value {
+                NewValue::EmptyObject => Item::Table(Table::new()),
+                _ => Item::Value(as_value()),
+            };
+            t.insert(key, item);
+        }
+        Slot::Inline(t) => {
+            if t.contains_key(key) {
+                return Err(DriverError::Exists);
+            }
+            // The space before `}` belongs to the last value: move it to the new one.
+            let mut suffix = String::new();
+            if let Some((_, last)) = t.iter_mut().last() {
+                last.decor()
+                    .suffix()
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .clone_into(&mut suffix);
+                last.decor_mut().set_suffix("");
+            }
+            let mut v = as_value();
+            v.decor_mut().set_prefix(" ");
+            v.decor_mut().set_suffix(suffix);
+            t.insert(key, v);
+        }
+        Slot::Array(a) => {
+            next_index(key, a.len())?;
+            a.push(as_value());
+        }
+        Slot::Tables(a) => {
+            next_index(key, a.len())?;
+            if *value != NewValue::EmptyObject {
+                return Err(DriverError::InvalidValue(
+                    "an array of tables only holds tables".into(),
+                ));
+            }
+            a.push(Table::new());
+        }
+        Slot::Scalar => return Err(DriverError::WrongKind("not a table or array")),
+    }
+    Ok(())
+}
+
+fn remove(slot: Slot<'_>, key: &str) -> Result<(), DriverError> {
+    let gone = match slot {
+        Slot::Table(t) => t.remove(key).is_some(),
+        Slot::Inline(t) => t.remove(key).is_some(),
+        Slot::Array(a) => match key.parse::<usize>() {
+            Ok(i) if i < a.len() => {
+                // Keep the layout: the new first element takes the old first's prefix.
+                let prefix = a
+                    .get(i)
+                    .and_then(|v| v.decor().prefix())
+                    .and_then(|p| p.as_str())
+                    .map(str::to_owned);
+                a.remove(i);
+                if i == 0
+                    && let (Some(first), Some(prefix)) = (a.get_mut(0), prefix)
+                {
+                    first.decor_mut().set_prefix(prefix);
+                }
+                true
+            }
+            _ => false,
+        },
+        Slot::Tables(a) => match key.parse::<usize>() {
+            Ok(i) if i < a.len() => {
+                a.remove(i);
+                true
+            }
+            _ => false,
+        },
+        Slot::Scalar => false,
+    };
+    if gone {
+        Ok(())
+    } else {
+        Err(DriverError::NotFound)
     }
 }
 

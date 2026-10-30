@@ -96,6 +96,22 @@ impl Caps {
         remove: false,
         mkdir: false,
     };
+    /// Everything.
+    pub const FULL: Self = Self {
+        read: true,
+        write_scalar: true,
+        insert: true,
+        remove: true,
+        mkdir: true,
+    };
+    /// Reads and scalar writes only.
+    pub const SCALARS: Self = Self {
+        read: true,
+        write_scalar: true,
+        insert: false,
+        remove: false,
+        mkdir: false,
+    };
 }
 
 /// An edit for [`Driver::splice`].
@@ -152,6 +168,19 @@ pub enum DriverError {
     /// The driver can't perform this operation.
     #[error("{0}")]
     Unsupported(&'static str),
+    /// No node at the pointer.
+    #[error("no such key")]
+    NotFound,
+    /// The key already exists (on insert).
+    #[error("the key already exists")]
+    Exists,
+    /// The target is an object or array where a scalar was needed, or the
+    /// other way round.
+    #[error("{0}")]
+    WrongKind(&'static str),
+    /// The new value doesn't fit the existing type.
+    #[error("{0}")]
+    InvalidValue(String),
 }
 
 impl DriverError {
@@ -184,6 +213,57 @@ pub fn text(src: &[u8]) -> Result<(&str, usize), DriverError> {
         offset: e.valid_up_to(),
     })?;
     Ok((s, if s.starts_with('\u{feff}') { 3 } else { 0 }))
+}
+
+/// Strips exactly one trailing `\n`, as written by `echo` (brief 4.3).
+#[must_use]
+pub fn strip_newline(text: &str) -> &str {
+    text.strip_suffix('\n').unwrap_or(text)
+}
+
+/// Replaces `range` of `src` with `with`.
+pub(crate) fn replace(src: &[u8], range: Range<usize>, with: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(src.len() - range.len() + with.len());
+    out.extend_from_slice(&src[..range.start]);
+    out.extend_from_slice(with.as_bytes());
+    out.extend_from_slice(&src[range.end..]);
+    out
+}
+
+/// Checks a scalar edit by re-parsing: the result must parse, and the value
+/// at `ptr` must have the same type and exactly the new text.
+pub(crate) fn check_scalar(
+    driver: &dyn Driver,
+    out: &[u8],
+    ptr: &[String],
+    ty: ScalarType,
+    text: &str,
+) -> Result<(), DriverError> {
+    let tree = driver
+        .parse(out)
+        .map_err(|_| DriverError::Unsupported("the edit would produce an invalid document"))?;
+    let node = tree.get(ptr).map(|id| tree.node(id));
+    match node {
+        Some(n) if n.kind == NodeKind::Scalar(ty) && n.text == text => Ok(()),
+        _ => Err(DriverError::InvalidValue(format!(
+            "the value can't be written as a {}",
+            type_name(ty)
+        ))),
+    }
+}
+
+/// Lowercase name of a scalar type, for messages.
+#[must_use]
+pub fn type_name(ty: ScalarType) -> &'static str {
+    match ty {
+        ScalarType::String => "string",
+        ScalarType::Integer => "integer",
+        ScalarType::Float => "float",
+        ScalarType::Bool => "boolean",
+        ScalarType::Null => "null",
+        ScalarType::Datetime => "date-time",
+        ScalarType::Text => "text",
+    }
 }
 
 /// Index of a node in [`Tree::nodes`].
