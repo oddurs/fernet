@@ -1,4 +1,4 @@
-//! Milestone 3: the read-only mount. Linux only; needs `/dev/fuse` and
+//! Milestone 3: the mount, read-only. Linux only; needs `/dev/fuse` and
 //! `fusermount3`. Skipped when FUSE is unavailable unless
 //! `FERNET_REQUIRE_FUSE=1` (set in CI), which turns a skip into a failure.
 
@@ -95,7 +95,7 @@ fn fixture() -> Option<Mounted> {
         .arg("mount")
         .arg(&backing)
         .arg(&mnt)
-        .arg("--daemon")
+        .args(["--daemon", "--read-only"])
         .status()
         .unwrap();
     assert!(st.success(), "mount failed");

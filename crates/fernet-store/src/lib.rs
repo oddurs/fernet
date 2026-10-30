@@ -772,6 +772,10 @@ group_commit_ms = 50
 # Segments roll over at this size.
 segment_bytes = 67108864
 
+[capture]
+# A path is captured once it has been quiet this long (mount and watch).
+debounce_ms = 2000
+
 [limits]
 # Files larger than this aren't captured.
 max_file_size = 52428800

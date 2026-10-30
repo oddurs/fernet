@@ -416,7 +416,10 @@ version = "0.0.0"
 dependencies = [
  "fernet-fs-core",
  "fernet-fs-formats",
+ "fernet-fs-path",
+ "fernet-fs-store",
  "fuser",
+ "notify",
  "tracing",
 ]
 

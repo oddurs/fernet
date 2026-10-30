@@ -13,13 +13,14 @@ mod cache;
 mod error;
 mod history;
 pub mod time;
+mod write;
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Component as PathComponent, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use fernet_fs_formats::{NodeKind, Registry, Tree};
+use fernet_fs_formats::{Registry, Tree};
 use fernet_fs_path::{Component, FernetPath, TimeSpec, decode_token, encode_token};
 use fernet_fs_store::{Mode, Store, Version};
 use jiff::Timestamp;
@@ -27,6 +28,7 @@ use jiff::tz::TimeZone;
 
 pub use cache::TreeCache;
 pub use error::{Error, Result};
+pub use fernet_fs_formats::{NewValue, NodeKind, ScalarType};
 pub use history::{DEFAULT_IGNORES, DEFAULT_MAX_FILE, Ignore, Stratum};
 pub use time::Target;
 
@@ -48,6 +50,7 @@ pub struct Fernet {
     clock: Clock,
     tz: TimeZone,
     ignore: Ignore,
+    locks: write::FileLocks,
 }
 
 /// How to open a root.
@@ -250,6 +253,7 @@ impl Fernet {
             clock: options.clock,
             tz: options.tz,
             ignore,
+            locks: write::FileLocks::default(),
         })
     }
 

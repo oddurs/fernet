@@ -409,3 +409,60 @@ real `fernet mount --daemon` binary and unmount with `fusermount3 -u`.
   `[parent.key]` table; in an inline table, `{}`.
 - **YAML** is scalars-only, as the brief says. Values behind aliases or carrying
   anchors or tags, and block scalars, are read-only (`EOPNOTSUPP`).
+
+## 38. Writes through `#`: atomic, locked, checked, captured
+
+**Decision.** `Fernet::write_value`, `insert` and `remove` take a per-file lock,
+read the file, splice it, write a temp file beside it (`.name.fernet-PID.tmp`,
+with the original's permissions), fsync it, re-check the original's mtime, size
+and hash, rename over it, and fsync the directory. If the file changed in
+between, the edit is retried once against the new content, then fails with
+`EAGAIN`. After the rename the file is snapshotted if this process holds the
+store. A write succeeds without a store: history is a bonus, the file is the
+truth (invariant 1). `fernet write` takes the writer lock when it's free and
+otherwise leaves capture to the process that holds it.
+
+## 39. The writable mount
+
+**Decision.**
+- From v0.4, `fernet mount` is writable by default and is the store's writer;
+  `--read-only` keeps the v0.3 behaviour.
+- Real files pass through: `open` (with `O_TRUNC`), `write_at`, `create`,
+  `mkdir`, `unlink`, `rmdir`, `rename` (including `RENAME_NOREPLACE`), `symlink`,
+  and `setattr` (size, mode, times). Hard links and changing ownership aren't
+  supported.
+- `#` values are edited in a per-handle buffer and applied on `flush` once
+  something was written, else on `release`. Shells `dup2` a redirection and
+  close the original fd before writing, so applying on the first flush would
+  write an empty value. A refused write (`EINVAL` for a wrong type) is returned
+  from `flush`/`fsync`/`close`. Shells ignore close errors on redirections; the
+  file is unchanged either way. New keys are inserted on first flush after a
+  write, with their type inferred from the text. `create` fails up front with
+  `EOPNOTSUPP` when the format can't add keys (YAML).
+- The mount asks the kernel for `FUSE_ATOMIC_O_TRUNC`, so `echo x > file#/key`
+  is one open-write-close on an empty buffer rather than a separate truncate.
+- Anything under `@`, and `.fernet` at the root, refuse changes (`EROFS`,
+  `EACCES`).
+- Renames rekey the inode table so open handles and kernel inodes follow the
+  file.
+
+## 40. Capture while mounted: one debouncer, trailing edge
+
+**Decision.** Every change (a written handle released, a truncate, a rename's
+source and target, an unlink, and every event from a `notify` watcher on the
+backing directory) touches its path in one debouncer. A path is captured once
+it has been quiet for `debounce_ms` (default 2000, in `config.toml`). Editors'
+atomic saves (vim renames the original to `file~` and writes a new file;
+JetBrains writes `file___jb_tmp___` and renames it over) are a burst on one path
+and land as exactly one version. Temp-file patterns are in the default ignore
+list, so they never appear in history. A change seen both through the mount and
+by the watcher can't be counted twice: they coalesce, and identical content is
+never recorded twice anyway. Unmounting captures everything still pending.
+
+## 41. `fernet mount` mustn't hold the stderr lock
+
+**Context.** The foreground mount held `stderr().lock()` for its lifetime;
+the first log line from a filesystem thread deadlocked the mount.
+
+**Decision.** The mount prints its banner with `eprintln!` and holds no lock.
+Tracing calls in the FUSE layer are cheap and safe to keep.

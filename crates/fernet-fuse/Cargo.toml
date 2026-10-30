@@ -33,4 +33,7 @@ broken_intra_doc_links = "deny"
 fernet-fs-core.workspace = true
 fernet-fs-formats.workspace = true
 fuser = "0.18"
+fernet-fs-store.workspace = true
+fernet-fs-path.workspace = true
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 tracing = "0.1"

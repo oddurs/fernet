@@ -12,8 +12,23 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use crate::time::{basic_name, nanos};
 use crate::{Entry, EntryKind, Error, Fernet, Resolved, Result, STORE_DIR, Source};
 
-/// Default ignore patterns (brief 4.4).
-pub const DEFAULT_IGNORES: [&str; 4] = [".git/", "node_modules/", "target/", ".DS_Store"];
+/// Default ignore patterns (brief 4.4), plus editors' temporary files
+/// (brief 4.6): vim swap and backup files and its `4913` probe, Emacs lock
+/// files, `*.tmp` (fernet's own temp files too) and `JetBrains` safe-write files.
+pub const DEFAULT_IGNORES: [&str; 12] = [
+    ".git/",
+    "node_modules/",
+    "target/",
+    ".DS_Store",
+    "*.swp",
+    "*.swx",
+    "*~",
+    ".#*",
+    "*.tmp",
+    "4913",
+    "*___jb_tmp___",
+    "*___jb_old___",
+];
 
 /// Default size limit for captured files: 50 MiB.
 pub const DEFAULT_MAX_FILE: u64 = 50 << 20;

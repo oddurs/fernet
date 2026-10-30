@@ -80,6 +80,34 @@ pub enum Error {
         /// The driver's error.
         source: DriverError,
     },
+    /// A value doesn't fit the type it replaces.
+    #[error("{path}: {message}")]
+    InvalidValue {
+        /// The path written.
+        path: String,
+        /// Why.
+        message: String,
+    },
+    /// The format can't make this edit.
+    #[error("{path}: {message}")]
+    Unsupported {
+        /// The path written.
+        path: String,
+        /// Why.
+        message: String,
+    },
+    /// A key being created already exists.
+    #[error("{path} already exists")]
+    Exists {
+        /// The path.
+        path: String,
+    },
+    /// The file changed on disk while being edited, twice in a row.
+    #[error("{path} kept changing while fernet was writing it; nothing was written")]
+    Changed {
+        /// The file.
+        path: String,
+    },
     /// An I/O error.
     #[error("{path}: {}", lowercase(source))]
     Io {
@@ -121,6 +149,9 @@ impl Error {
         const ENOTDIR: i32 = 20;
         const EISDIR: i32 = 21;
         const EINVAL: i32 = 22;
+        const EEXIST: i32 = 17;
+        const EAGAIN: i32 = if cfg!(target_os = "macos") { 35 } else { 11 };
+        const EOPNOTSUPP: i32 = if cfg!(target_os = "macos") { 102 } else { 95 };
         const EROFS: i32 = 30;
         match self {
             Self::NotFound { .. }
@@ -132,7 +163,10 @@ impl Error {
             Self::Store(_) => EIO,
             Self::NotADirectory { .. } => ENOTDIR,
             Self::IsADirectory { .. } => EISDIR,
-            Self::Parse { .. } => EINVAL,
+            Self::Parse { .. } | Self::InvalidValue { .. } => EINVAL,
+            Self::Unsupported { .. } => EOPNOTSUPP,
+            Self::Exists { .. } => EEXIST,
+            Self::Changed { .. } => EAGAIN,
             Self::Io { source, .. } => source.raw_os_error().unwrap_or(EIO),
         }
     }

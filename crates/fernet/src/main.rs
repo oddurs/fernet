@@ -44,6 +44,13 @@ enum Command {
         /// A fernet path. Default: the current directory.
         path: Option<OsString>,
     },
+    /// Set a value (or a whole file). Reads stdin when the value is - or missing.
+    Write {
+        /// A fernet path: a value inside a file, a new key, or a real file.
+        path: OsString,
+        /// The new value.
+        value: Option<String>,
+    },
     /// Core sample: the history of a file or value, newest first.
     Core {
         /// A fernet path.
@@ -76,7 +83,7 @@ enum Command {
     Verify,
     /// Rebuild the index from the log.
     Reindex,
-    /// Mount dir at mountpoint (read-only), in the foreground unless --daemon.
+    /// Mount dir at mountpoint, in the foreground unless --daemon.
     #[cfg(feature = "mount")]
     Mount {
         /// The backing directory.
@@ -86,6 +93,9 @@ enum Command {
         /// Detach and run in the background.
         #[arg(long)]
         daemon: bool,
+        /// Refuse all writes.
+        #[arg(long)]
+        read_only: bool,
     },
     /// Capture changes in the foreground until interrupted.
     Watch {
@@ -207,7 +217,11 @@ fn failure(e: &Error, arg: &OsStr) -> Failure {
         Error::OutsideRoot { .. } => {
             Failure::new(msg, exit::USAGE).hint("pass --root <dir> to widen the root")
         }
-        Error::Parse { .. } => Failure::new(msg, exit::INVALID),
+        Error::Parse { .. }
+        | Error::InvalidValue { .. }
+        | Error::Unsupported { .. }
+        | Error::Exists { .. } => Failure::new(msg, exit::INVALID),
+        Error::Changed { .. } => Failure::new(msg, exit::INTERNAL).hint("try again"),
         Error::Store(s) => store_failure(s),
         Error::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
             Failure::new(msg, exit::NOT_FOUND)
@@ -316,6 +330,23 @@ fn run(cli: &Cli) -> Result<u8, Failure> {
                 out.write_all(b"\n")?;
             }
         }
+        Command::Write { path, value } => {
+            // Capture the change when the store is free; when another process
+            // holds it (a mount or a watcher), that process captures it.
+            let ctx = match Ctx::open(cli, Mode::Write) {
+                Err(f) if f.code == exit::STORE => Ctx::open(cli, Mode::Read)?,
+                other => other?,
+            };
+            let value = match value.as_deref() {
+                None | Some("-") => {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                    buf
+                }
+                Some(v) => v.to_owned(),
+            };
+            write(&ctx, path, &value)?;
+        }
         Command::Core { path } => {
             let ctx = Ctx::open(cli, Mode::Read)?;
             let p = ctx.fernet_path(path)?;
@@ -360,9 +391,10 @@ fn run(cli: &Cli) -> Result<u8, Failure> {
             dir,
             mountpoint,
             daemon,
+            read_only,
         } => {
             drop(out);
-            return mount(dir, mountpoint, *daemon);
+            return mount(dir, mountpoint, *daemon, *read_only);
         }
         Command::Watch { dir } => {
             drop(out);
@@ -460,7 +492,7 @@ fn is_mounted(path: &Path) -> bool {
 }
 
 #[cfg(feature = "mount")]
-fn mount(dir: &Path, mountpoint: &Path, daemon: bool) -> Result<u8, Failure> {
+fn mount(dir: &Path, mountpoint: &Path, daemon: bool, read_only: bool) -> Result<u8, Failure> {
     let mountpoint = std::fs::canonicalize(mountpoint).map_err(|e| {
         Failure::new(
             format!("{}: {}", mountpoint.display(), e).to_lowercase(),
@@ -470,11 +502,12 @@ fn mount(dir: &Path, mountpoint: &Path, daemon: bool) -> Result<u8, Failure> {
     if daemon {
         // Re-run in the foreground, detached from this terminal's process group.
         use std::os::unix::process::CommandExt;
-        let exe = std::env::current_exe()?;
-        let mut child = std::process::Command::new(exe)
-            .arg("mount")
-            .arg(dir)
-            .arg(&mountpoint)
+        let mut cmd = std::process::Command::new(std::env::current_exe()?);
+        cmd.arg("mount").arg(dir).arg(&mountpoint);
+        if read_only {
+            cmd.arg("--read-only");
+        }
+        let mut child = cmd
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -500,10 +533,12 @@ fn mount(dir: &Path, mountpoint: &Path, daemon: bool) -> Result<u8, Failure> {
             exit::INTERNAL,
         ));
     }
+    // A writable mount is the store's writer: it captures history itself.
+    let mode = if read_only { Mode::Read } else { Mode::Write };
     let fernet = Fernet::open_with(
         dir,
         Options {
-            mode: Mode::Read,
+            mode,
             ..Options::default()
         },
     )
@@ -515,12 +550,18 @@ fn mount(dir: &Path, mountpoint: &Path, daemon: bool) -> Result<u8, Failure> {
             exit::USAGE,
         ));
     }
-    let session = fernet_fs_fuse::spawn(std::sync::Arc::new(fernet), &mountpoint).map_err(|e| {
-        Failure::new(
-            format!("can't mount at {}: {e}", mountpoint.display()).to_lowercase(),
-            exit::INTERNAL,
-        )
-    })?;
+    let window = fernet
+        .store()
+        .and_then(|s| fernet_fs_store::config_u64(s.dir(), "debounce_ms"))
+        .map_or(fernet_fs_fuse::DEFAULT_WINDOW, Duration::from_millis);
+    let session =
+        fernet_fs_fuse::spawn(std::sync::Arc::new(fernet), &mountpoint, !read_only, window)
+            .map_err(|e| {
+                Failure::new(
+                    format!("can't mount at {}: {e}", mountpoint.display()).to_lowercase(),
+                    exit::INTERNAL,
+                )
+            })?;
     let (tx, rx) = mpsc::channel();
     ctrlc::set_handler(move || {
         let _ = tx.send(());
@@ -531,13 +572,12 @@ fn mount(dir: &Path, mountpoint: &Path, daemon: bool) -> Result<u8, Failure> {
             exit::INTERNAL,
         )
     })?;
-    let mut err = std::io::stderr().lock();
-    writeln!(
-        err,
+    // Not holding the stderr lock: the filesystem threads log to stderr.
+    eprintln!(
         "mounted {} at {}; ctrl-c to unmount",
         root.display(),
         mountpoint.display()
-    )?;
+    );
     loop {
         if rx.recv_timeout(Duration::from_millis(250)).is_ok() {
             session.umount_and_join()?;
@@ -549,6 +589,60 @@ fn mount(dir: &Path, mountpoint: &Path, daemon: bool) -> Result<u8, Failure> {
             return Ok(0);
         }
     }
+}
+
+/// `fernet write`: a value, a new key in an object or array, or a real file.
+fn write(ctx: &Ctx, arg: &OsStr, value: &str) -> Result<(), Failure> {
+    let f = &ctx.fernet;
+    let mut names = f.user_names(&ctx.cwd, arg).map_err(|e| failure(&e, arg))?;
+    let Some(last) = names.pop() else {
+        return Err(Failure::new("can't write the root", exit::USAGE));
+    };
+    let parent = f
+        .resolve_names(names.iter().map(OsString::as_os_str))
+        .map_err(|e| failure(&e, arg))?;
+    let target = f.lookup(&parent, &last).map_err(|e| failure(&e, arg))?;
+    let res = match (&target, &parent) {
+        (
+            Resolved::Inside {
+                node: fernet_fs_core::NodeKind::Scalar(_),
+                ..
+            },
+            _,
+        ) => f.write_value(&target, value),
+        (Resolved::RealFile { .. }, _) => f.write_file(&target, value.as_bytes()),
+        (Resolved::Missing, Resolved::Inside { .. }) => {
+            let key = fernet_fs_path::decode_token(&last.to_string_lossy())
+                .ok_or_else(|| Failure::new("invalid ~ escape in the key", exit::USAGE))?;
+            f.insert(
+                &parent,
+                &key,
+                fernet_fs_core::NewValue::Text(value.to_owned()),
+            )
+        }
+        (Resolved::Missing, Resolved::RealDir { path }) => {
+            let path = path.join(&last);
+            std::fs::write(&path, value).map_err(|e| {
+                Failure::new(
+                    format!("{}: {e}", path.display()).to_lowercase(),
+                    exit::INTERNAL,
+                )
+            })?;
+            f.snapshot(&path).map(|_| ()).or(Ok(()))
+        }
+        (r, _) if r.is_past() => Err(Error::ReadOnly {
+            path: arg.to_string_lossy().into_owned(),
+        }),
+        (Resolved::Missing, _) => Err(Error::NotFound {
+            parent: String::new(),
+            name: arg.to_string_lossy().into_owned(),
+            inside: false,
+        }),
+        _ => Err(Error::IsADirectory {
+            path: arg.to_string_lossy().into_owned(),
+        }),
+    };
+    res.map_err(|e| failure(&e, arg))
 }
 
 fn out_flush() -> std::io::Result<()> {
