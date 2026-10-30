@@ -112,3 +112,69 @@ Keys with NUL or an encoded length over 255 bytes are left out of listings.
 
 **Decision.** At most one time lens and one open lens apply, the time lens on the
 open component or before it. Later lens-shaped segments are literal.
+
+## 11. Additions to the driver types in brief 4.3
+
+**Decision.**
+- `ScalarType::Datetime`, for TOML's first-class date-times. Folding them into
+  `String` would let a type-preserving write turn a date into a string later.
+- `Node::key_span`, so listings, messages and inserts know where key text sits.
+- `Node::text`, the scalar as fernet shows it, decoded once at parse time.
+  Strings are unescaped; every other scalar is its source text (`0x1F`, `1e3`
+  and `1979-05-27 07:32:00Z` read back as written).
+- `Driver::extensions` and `Driver::sniff`, with `detect` as a provided method.
+  `Registry` uses them separately, so one driver's sniff never overrides another
+  driver's extension. Sniffing only runs for unclaimed extensions, is skipped
+  for heads containing NUL, and runs TOML before JSON (`[[package]]`).
+- Duplicate keys keep their first position and take the last value, matching
+  `serde_json`.
+
+## 12. TOML via `toml_edit`
+
+**Context.** Brief 4.3 asks whether `toml_edit` exposes reliable byte spans.
+
+**Decision.** It does: parsing into `toml_edit::Document` (before `despan`)
+gives exact byte ranges for keys, values, inline-table entries and table headers,
+including dotted keys and arrays of tables. Verified by a spike and kept as unit
+and golden tests. It doesn't accept a BOM, so the driver parses after it and
+shifts spans.
+
+**Consequences.** A table's `span` is its header line only: TOML tables can be
+split across a file (`[a]` … `[c]` … `[a.b]`), so "the whole node" isn't one
+range. Removal (M4) will need a list of ranges. Implicit tables (`a` in `[a.b]`)
+use their key's span.
+
+## 13. YAML via `saphyr-parser` events
+
+**Context.** Brief 4.3 suggests the saphyr family.
+
+**Decision.** `saphyr-parser` 0.3's event stream gives start and end markers
+for every scalar. Two adjustments: markers count **characters**, so the driver
+maps them to byte offsets; and a scalar's span includes its `&anchor`/`!tag`
+properties and, for block scalars, starts at the content. The driver strips
+properties and widens block scalars to start at their `|`/`>` header, so every
+value span is a self-contained YAML value.
+
+v0.1 read semantics: the first document only; aliases resolve to the anchored
+node (recursive aliases are an error); `<<` merge keys are ordinary keys;
+mapping, sequence and alias keys are left out; untagged plain scalars follow the
+YAML 1.2 core schema; quoted, block and custom-tagged scalars are strings. An
+empty value (`a:`) is a null that reads as an empty line.
+
+**Rejected.** `yaml-rust2` (same lineage, older span support). Writing our own
+YAML parser.
+
+## 14. Reference parsers for golden tests (dev-only)
+
+**Decision.** `serde_json` (with `arbitrary_precision` and `preserve_order`),
+`toml`, and `serde_norway` for YAML. `serde_yaml` itself is deprecated, and
+`saphyr` shares our parser's lineage, so it can't be an independent reference.
+The JSONC golden files go through a small comment and trailing-comma stripper
+written in the test.
+
+## 15. The JSON driver accepts JSONC everywhere
+
+**Decision.** `//` and `/* */` comments and trailing commas are accepted in any
+JSON file, not just `.jsonc`. Strict JSON is a subset, so nothing valid is
+rejected; tsconfig and VS Code settings need both. Nesting is limited to 512
+levels in every driver.

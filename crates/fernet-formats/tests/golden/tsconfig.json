@@ -1,0 +1,18 @@
+// TypeScript config, JSONC style.
+{
+  /* Visit https://aka.ms/tsconfig to read more */
+  "compilerOptions": {
+    "target": "ES2022", // modern runtimes
+    "module": "NodeNext",
+    "strict": true,
+    "paths": {
+      "@/*": ["./src/*"], // alias
+    },
+    "lib": ["ES2022", "DOM",],
+    "outDir": "dist", /* trailing block comment */
+  },
+  "include": ["src/**/*.ts", "url://not-a-comment/*"],
+  "exclude": [
+    "node_modules",
+  ],
+}

@@ -1,0 +1,40 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  labels: &labels
+    app: web
+    tier: "front end"
+  annotations:
+    note: 'it''s quoted'
+    escaped: "tab\tnewline\nunicode é \x41"
+spec:
+  replicas: 3
+  selector:
+    matchLabels: *labels
+  template:
+    metadata:
+      labels: *labels
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27
+          args: ["--port", "80"]
+          resources:
+            limits: {cpu: 500m, memory: 128Mi}
+          ports:
+            - containerPort: 80
+              protocol: TCP
+      tolerations: []
+      nodeSelector: {}
+  numbers: [0o14, 0x1F, -12, +7, 1.5e3, .5, -.inf, 1_000]
+  plain multi: this plain scalar
+    continues here
+  "quoted key": yes
+  ? explicit key
+  : explicit value
+  1: integer key
+  true: bool key
+---
+second: document

@@ -5,12 +5,18 @@ edition = "2024"
 publish = false
 license = "MIT OR Apache-2.0"
 
+[lib]
+name = "fernet_fuzz"
+path = "src/lib.rs"
+
 [package.metadata]
 cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
 fernet-fs-path = { path = "../crates/fernet-path" }
+fernet-fs-formats = { path = "../crates/fernet-formats" }
+serde_json = "1"
 
 # Kept out of the main workspace: it needs nightly and its own lockfile.
 [workspace]
@@ -18,6 +24,27 @@ fernet-fs-path = { path = "../crates/fernet-path" }
 [[bin]]
 name = "path_parse"
 path = "fuzz_targets/path_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "json_parse"
+path = "fuzz_targets/json_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "toml_parse"
+path = "fuzz_targets/toml_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "yaml_parse"
+path = "fuzz_targets/yaml_parse.rs"
 test = false
 doc = false
 bench = false

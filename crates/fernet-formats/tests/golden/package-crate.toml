@@ -1,0 +1,48 @@
+# A crate manifest with most TOML features.
+[package]
+name = "demo"   # inline comment
+version = "0.3.0"
+authors = ["Ana <ana@example.com>", 'Bo "B" <bo@example.com>']
+description = """
+A multi-line
+description with "quotes" and \t escapes.\
+  Line continuation."""
+readme = '''
+literal\n not escaped
+'''
+keywords = [
+  "cli",
+  "files",   # trailing comma follows
+]
+published = 1979-05-27T07:32:00Z
+local-date = 2026-10-01
+local-time = 07:32:00
+local-dt = 1979-05-27 07:32:00.999999
+"quoted key" = "q"
+'literal key' = 1_000
+hex = 0xDEAD_beef
+oct = 0o755
+bin = 0b1101
+float = 6.626e-34
+inf = inf
+neg-inf = -inf
+under = 224_617.445_991
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "demo"
+path = "src/main.rs"
+
+[[bin]]
+name = "demo-helper"
+path = "src/helper.rs"
+required-features = ["serde"]
+
+[package.metadata.docs]
+all-features = true

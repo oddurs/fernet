@@ -1,0 +1,27 @@
+{
+  "name": "@acme/web",
+  "version": "2.4.1",
+  "private": true,
+  "description": "The \"web\" front end — with ünïcödé and a tab\there",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json && vite build",
+    "test": "vitest run --coverage",
+    "lint": "eslint 'src/**/*.{ts,tsx}'"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "zod": "~3.23.8"
+  },
+  "devDependencies": {
+    "typescript": "5.6.3",
+    "vite": "^5.4.10"
+  },
+  "engines": { "node": ">=20" },
+  "files": ["dist", "README.md"],
+  "workspaces": [],
+  "config": { "port": 8080, "ratio": 0.75, "big": 12345678901234567890123, "exp": 1E+2, "neg": -0, "none": null, "on": false },
+  "path/with~special": "escaped key",
+  "emoji": "😀 é\/"
+}

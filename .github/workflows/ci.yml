@@ -67,7 +67,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [path_parse]
+        target: [path_parse, json_parse, toml_parse, yaml_parse]
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install nightly --profile minimal
