@@ -5,23 +5,30 @@
 //! The primitive is [`Fernet::lookup`], one component at a time, which is how
 //! the kernel resolves paths; [`Fernet::resolve`] is a fold over it.
 //!
-//! Milestone 1 resolves real paths and `#` lenses. Time lenses need the store
-//! (milestone 2) and resolve to [`Error::NoHistory`] until then.
+//! Time lenses need a store (`.fernet/`); without one they resolve to
+//! [`Error::NoHistory`].
 #![forbid(unsafe_code)]
 
 mod cache;
 mod error;
+mod history;
+pub mod time;
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Component as PathComponent, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use fernet_fs_formats::{NodeKind, Registry, Tree};
-use fernet_fs_path::{Component, FernetPath, decode_token, encode_token};
+use fernet_fs_path::{Component, FernetPath, TimeSpec, decode_token, encode_token};
+use fernet_fs_store::{Mode, Store, Version};
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 
 pub use cache::TreeCache;
 pub use error::{Error, Result};
+pub use history::{DEFAULT_IGNORES, DEFAULT_MAX_FILE, Ignore, Stratum};
+pub use time::Target;
 
 /// The name of the store directory, hidden from listings at the root.
 pub const STORE_DIR: &str = ".fernet";
@@ -29,11 +36,38 @@ pub const STORE_DIR: &str = ".fernet";
 /// Longest name a listing will show, in bytes (`NAME_MAX` on Linux and macOS).
 pub const NAME_MAX: usize = 255;
 
-/// A fernet root: a backing directory, its drivers and (later) its store.
+/// A clock: the current instant.
+pub type Clock = Box<dyn Fn() -> Timestamp + Send + Sync>;
+
+/// A fernet root: a backing directory, its drivers and its store.
 pub struct Fernet {
     root: PathBuf,
     registry: Registry,
     cache: TreeCache,
+    store: Option<Mutex<Store>>,
+    clock: Clock,
+    tz: TimeZone,
+    ignore: Ignore,
+}
+
+/// How to open a root.
+pub struct Options {
+    /// How to open the store, if there is one.
+    pub mode: Mode,
+    /// The clock; default the system clock.
+    pub clock: Clock,
+    /// The user's time zone; default the system zone (`TZ` is honoured).
+    pub tz: TimeZone,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            mode: Mode::Read,
+            clock: Box::new(Timestamp::now),
+            tz: TimeZone::system(),
+        }
+    }
 }
 
 /// What a path resolves to.
@@ -48,6 +82,25 @@ pub enum Resolved {
     /// A directory in the backing directory.
     RealDir {
         /// Absolute path in the backing directory.
+        path: PathBuf,
+    },
+    /// A file as it was: one recorded version.
+    PastFile {
+        /// Absolute path the file had in the backing directory.
+        path: PathBuf,
+        /// The version.
+        version: Version,
+    },
+    /// A directory as it was at an instant.
+    PastDir {
+        /// Absolute path in the backing directory.
+        path: PathBuf,
+        /// UTC nanoseconds.
+        at: i64,
+    },
+    /// The directory of a file's kept versions (`notes.md@`).
+    VersionListing {
+        /// Absolute path of the file in the backing directory.
         path: PathBuf,
     },
     /// A node inside a structured file (`config.json#/server/port`).
@@ -68,6 +121,23 @@ pub enum Resolved {
 pub enum Source {
     /// A file in the backing directory, at the present.
     Present(PathBuf),
+    /// A recorded version of a file.
+    Past {
+        /// The file's path, for format detection and messages.
+        path: PathBuf,
+        /// The version.
+        version: Version,
+    },
+}
+
+impl Source {
+    /// The file's path in the backing directory.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Present(p) | Self::Past { path: p, .. } => p,
+        }
+    }
 }
 
 impl Resolved {
@@ -77,8 +147,25 @@ impl Resolved {
         matches!(
             self,
             Self::RealDir { .. }
+                | Self::PastDir { .. }
+                | Self::VersionListing { .. }
                 | Self::Inside {
                     node: NodeKind::Object | NodeKind::Array,
+                    ..
+                }
+        )
+    }
+
+    /// True for anything in the past, which is read-only.
+    #[must_use]
+    pub fn is_past(&self) -> bool {
+        matches!(
+            self,
+            Self::PastFile { .. }
+                | Self::PastDir { .. }
+                | Self::VersionListing { .. }
+                | Self::Inside {
+                    source: Source::Past { .. },
                     ..
                 }
         )
@@ -125,24 +212,61 @@ impl EntryKind {
 }
 
 impl Fernet {
-    /// Opens a root. A missing `.fernet/` is fine: without a store there is no
-    /// history, but real paths and `#` lenses work.
+    /// Opens a root with default options: the store (if any) read-only, the
+    /// system clock and time zone. Without `.fernet/` there is no history, but
+    /// real paths and `#` lenses work.
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] if `root` can't be canonicalised or isn't a directory.
+    /// [`Error::Io`] if `root` can't be canonicalised or isn't a directory;
+    /// store errors.
     pub fn open(root: &Path) -> Result<Self> {
+        Self::open_with(root, Options::default())
+    }
+
+    /// Opens a root with explicit options.
+    ///
+    /// # Errors
+    ///
+    /// As [`Fernet::open`].
+    pub fn open_with(root: &Path, options: Options) -> Result<Self> {
         let root = fs::canonicalize(root).map_err(|e| Error::io(root, e))?;
         if !root.is_dir() {
             return Err(Error::NotADirectory {
                 path: root.display().to_string(),
             });
         }
+        let store = if Store::exists(&root) {
+            Some(Mutex::new(Store::open(&root, options.mode)?))
+        } else {
+            None
+        };
+        let ignore = Ignore::load(&root);
         Ok(Self {
             root,
             registry: Registry::default(),
             cache: TreeCache::default(),
+            store,
+            clock: options.clock,
+            tz: options.tz,
+            ignore,
         })
+    }
+
+    /// Creates a store under `root` and opens the root for writing.
+    ///
+    /// # Errors
+    ///
+    /// Store errors ([`fernet_fs_store::Error::Exists`] if there is one).
+    pub fn init(root: &Path, options: Options) -> Result<Self> {
+        drop(Store::init(root)?);
+        Self::open_with(
+            root,
+            Options {
+                mode: Mode::Write,
+                ..options
+            },
+        )
     }
 
     /// The canonical root directory.
@@ -159,24 +283,68 @@ impl Fernet {
         }
     }
 
+    /// The store, if there is one.
+    pub fn store(&self) -> Option<MutexGuard<'_, Store>> {
+        self.store
+            .as_ref()
+            .map(|m| m.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    fn need_store(&self, path: &Path) -> Result<MutexGuard<'_, Store>> {
+        self.store().ok_or_else(|| Error::NoHistory {
+            path: self.display(path),
+        })
+    }
+
+    /// The current instant.
+    #[must_use]
+    pub fn now(&self) -> Timestamp {
+        (self.clock)()
+    }
+
+    /// The user's time zone.
+    #[must_use]
+    pub fn tz(&self) -> &TimeZone {
+        &self.tz
+    }
+
+    /// A local date-time for messages: `2026-09-14 09:30`.
+    fn local_date(&self, nanos: i64) -> String {
+        time::timestamp(nanos)
+            .to_zoned(self.tz.clone())
+            .strftime("%Y-%m-%d %H:%M")
+            .to_string()
+    }
+
+    /// The ignore rules.
+    #[must_use]
+    pub fn ignore(&self) -> &Ignore {
+        &self.ignore
+    }
+
     /// Resolves one component under `parent`. This is the step the mount
     /// calls for every kernel lookup.
     ///
-    /// Real names win: the backing directory is checked for `name` verbatim
-    /// before any lens is read from it.
+    /// Real names win: the backing directory (or, under a time lens, the
+    /// directory as it was) is checked for `name` verbatim before any lens is
+    /// read from it.
     ///
     /// # Errors
     ///
-    /// [`Error::NoHistory`] for time lenses (until milestone 2),
+    /// [`Error::NoHistory`] for time lenses without a store,
     /// [`Error::NotADirectory`] under a file, [`Error::OutsideRoot`] for `..`
-    /// at the root, and parse or I/O errors from opening a file.
+    /// at the root, [`Error::NoMark`], and parse, store or I/O errors.
     pub fn lookup(&self, parent: &Resolved, name: &OsStr) -> Result<Resolved> {
         match parent {
             Resolved::Missing => Ok(Resolved::Missing),
-            Resolved::RealFile { path } => Err(Error::NotADirectory {
-                path: self.display(path),
-            }),
+            Resolved::RealFile { path } | Resolved::PastFile { path, .. } => {
+                Err(Error::NotADirectory {
+                    path: self.display(path),
+                })
+            }
             Resolved::RealDir { path } => self.lookup_real(path, name),
+            Resolved::PastDir { path, at } => self.lookup_past(path, *at, name),
+            Resolved::VersionListing { path } => self.lookup_listing(path, name),
             Resolved::Inside {
                 source,
                 pointer,
@@ -216,20 +384,35 @@ impl Fernet {
             return Ok(Resolved::Missing);
         };
         let c = Component::parse(text);
-        if c.when.is_some() {
-            return Err(Error::NoHistory {
-                path: self.display(&dir.join(text)),
-            });
+        let target = dir.join(&c.name);
+        if let Some(spec) = &c.when {
+            let found = self.travel(&target, spec)?;
+            return if c.open {
+                self.open_lens(found)
+            } else {
+                Ok(found)
+            };
         }
         if !c.open {
             return Ok(Resolved::Missing);
         }
-        let file = dir.join(&c.name);
-        match fs::metadata(&file) {
-            Ok(m) if m.is_file() => {}
-            _ => return Ok(Resolved::Missing),
+        match fs::metadata(&target) {
+            Ok(m) if m.is_file() => self.open_source(Source::Present(target)),
+            _ => Ok(Resolved::Missing),
         }
-        let source = Source::Present(file);
+    }
+
+    /// Opens a past file with the `#` lens.
+    fn open_lens(&self, r: Resolved) -> Result<Resolved> {
+        match r {
+            Resolved::PastFile { path, version } => {
+                self.open_source(Source::Past { path, version })
+            }
+            _ => Ok(Resolved::Missing),
+        }
+    }
+
+    fn open_source(&self, source: Source) -> Result<Resolved> {
         let Some(tree) = self.tree(&source)? else {
             return Ok(Resolved::Missing);
         };
@@ -239,6 +422,134 @@ impl Fernet {
             pointer: Vec::new(),
             node,
         })
+    }
+
+    /// The store path of a backing path: relative, `/`-separated, UTF-8.
+    pub(crate) fn rel(&self, path: &Path) -> Option<String> {
+        let rel = path.strip_prefix(&self.root).ok()?;
+        let parts: Option<Vec<&str>> = rel.components().map(|c| c.as_os_str().to_str()).collect();
+        Some(parts?.join("/"))
+    }
+
+    /// Applies a time lens to `path` (a file or directory, present or not).
+    fn travel(&self, path: &Path, spec: &TimeSpec) -> Result<Resolved> {
+        let store = self.need_store(path)?;
+        let Some(rel) = self.rel(path) else {
+            return Ok(Resolved::Missing);
+        };
+        let target = time::resolve(spec, self.now(), &self.tz, &store.marks()?)?;
+        let kept: Vec<Version> = store
+            .versions(&rel)?
+            .into_iter()
+            .filter(|v| v.hash.is_some())
+            .collect();
+        let file = |v: Option<&Version>| match v {
+            Some(v) => Resolved::PastFile {
+                path: path.to_owned(),
+                version: v.clone(),
+            },
+            None => Resolved::Missing,
+        };
+        Ok(match target {
+            Target::At(t) => match history::entry_at(&store, path, &rel, t)? {
+                // The file has history, but none that early: say so.
+                Resolved::Missing if kept.first().is_some_and(|v| v.time > t) => {
+                    return Err(Error::NoVersion {
+                        path: self.display(path),
+                        before: self.local_date(t),
+                        first: kept
+                            .first()
+                            .map(|v| self.local_date(v.time))
+                            .unwrap_or_default(),
+                    });
+                }
+                found => found,
+            },
+            Target::Back(n) => file(kept.iter().rev().nth(n as usize)),
+            Target::First if !kept.is_empty() => file(kept.first()),
+            Target::First => match history::first_under(&store, &rel)? {
+                Some(t) => Resolved::PastDir {
+                    path: path.to_owned(),
+                    at: t,
+                },
+                None => Resolved::Missing,
+            },
+            Target::Listing if kept.is_empty() => Resolved::Missing,
+            Target::Listing => Resolved::VersionListing {
+                path: path.to_owned(),
+            },
+        })
+    }
+
+    /// Looks up `name` in a directory as it was at `at`. Names that existed
+    /// then win; then `#` opens a past file. A second time lens is literal.
+    fn lookup_past(&self, dir: &Path, at: i64, name: &OsStr) -> Result<Resolved> {
+        if name == "." || name.is_empty() {
+            return Ok(Resolved::PastDir {
+                path: dir.to_owned(),
+                at,
+            });
+        }
+        if name == ".." {
+            return match dir.parent() {
+                Some(up) if dir != self.root => Ok(Resolved::PastDir {
+                    path: up.to_owned(),
+                    at,
+                }),
+                _ => Err(Error::OutsideRoot { path: "..".into() }),
+            };
+        }
+        let Some(text) = name.to_str() else {
+            return Ok(Resolved::Missing);
+        };
+        let store = self.need_store(dir)?;
+        let child = dir.join(text);
+        let Some(rel) = self.rel(&child) else {
+            return Ok(Resolved::Missing);
+        };
+        let found = history::entry_at(&store, &child, &rel, at)?;
+        if found != Resolved::Missing {
+            return Ok(found);
+        }
+        let c = Component::parse(text);
+        if !c.open || c.when.is_some() {
+            return Ok(Resolved::Missing);
+        }
+        let file = dir.join(&c.name);
+        let Some(rel) = self.rel(&file) else {
+            return Ok(Resolved::Missing);
+        };
+        let found = history::entry_at(&store, &file, &rel, at)?;
+        drop(store);
+        self.open_lens(found)
+    }
+
+    fn lookup_listing(&self, path: &Path, name: &OsStr) -> Result<Resolved> {
+        let Some(text) = name.to_str() else {
+            return Ok(Resolved::Missing);
+        };
+        let (text, open) = match text.strip_suffix('#') {
+            Some(t) => (t, true),
+            None => (text, false),
+        };
+        let store = self.need_store(path)?;
+        let Some(rel) = self.rel(path) else {
+            return Ok(Resolved::Missing);
+        };
+        let entries = history::listing(&store, &rel)?;
+        drop(store);
+        let Some((_, version)) = entries.into_iter().find(|(n, _)| n == text) else {
+            return Ok(Resolved::Missing);
+        };
+        let found = Resolved::PastFile {
+            path: path.to_owned(),
+            version,
+        };
+        if open {
+            self.open_lens(found)
+        } else {
+            Ok(found)
+        }
     }
 
     fn lookup_inside(&self, source: &Source, pointer: &[String], name: &OsStr) -> Result<Resolved> {
@@ -304,14 +615,13 @@ impl Fernet {
         Ok(at)
     }
 
-    /// Resolves a path given the way a user types it on the command line:
-    /// relative to `cwd`, or absolute. `.` and `..` are applied lexically, and
-    /// the result must lie inside the root.
+    /// Splits a path typed on the command line (relative to `cwd`, or
+    /// absolute) into names below the root. `.` and `..` apply lexically.
     ///
     /// # Errors
     ///
-    /// [`Error::OutsideRoot`], or as [`Fernet::resolve_names`].
-    pub fn resolve_user_path(&self, cwd: &Path, arg: &OsStr) -> Result<Resolved> {
+    /// [`Error::OutsideRoot`].
+    pub fn user_names(&self, cwd: &Path, arg: &OsStr) -> Result<Vec<OsString>> {
         let joined = cwd.join(arg);
         let mut parts: Vec<&OsStr> = Vec::new();
         for c in joined.components() {
@@ -336,21 +646,37 @@ impl Fernet {
                 path: arg.to_string_lossy().into_owned(),
             });
         }
-        self.resolve_names(parts[root_parts.len()..].iter().copied())
+        Ok(parts[root_parts.len()..]
+            .iter()
+            .map(|p| (*p).to_owned())
+            .collect())
     }
 
-    /// The bytes of a file or value.
+    /// Resolves a path given the way a user types it on the command line.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::OutsideRoot`], or as [`Fernet::resolve_names`].
+    pub fn resolve_user_path(&self, cwd: &Path, arg: &OsStr) -> Result<Resolved> {
+        let names = self.user_names(cwd, arg)?;
+        self.resolve_names(names.iter().map(OsString::as_os_str))
+    }
+
+    /// The bytes of a file, past file or value.
     ///
     /// # Errors
     ///
     /// [`Error::IsADirectory`] for directories, [`Error::NotFound`] for
-    /// [`Resolved::Missing`], I/O and parse errors.
+    /// [`Resolved::Missing`], store, I/O and parse errors.
     pub fn read(&self, r: &Resolved) -> Result<Vec<u8>> {
         match r {
             Resolved::RealFile { path } => fs::read(path).map_err(|e| Error::io(path, e)),
-            Resolved::RealDir { path } => Err(Error::IsADirectory {
+            Resolved::RealDir { path }
+            | Resolved::PastDir { path, .. }
+            | Resolved::VersionListing { path } => Err(Error::IsADirectory {
                 path: self.display(path),
             }),
+            Resolved::PastFile { path, version } => Ok(self.need_store(path)?.read(version)?),
             Resolved::Inside {
                 source, pointer, ..
             } => {
@@ -364,22 +690,21 @@ impl Fernet {
                     path: self.display_inside(source, pointer),
                 })
             }
-            Resolved::Missing => Err(Error::NotFound {
-                parent: String::new(),
-                name: String::new(),
-                inside: false,
-            }),
+            Resolved::Missing => Err(missing()),
         }
     }
 
-    /// The entries of a directory, sorted by name. Real directories list
-    /// exactly their real entries (minus `.fernet/` at the root), with real
-    /// sizes and types (invariant 3). Opened files list keys in source order,
-    /// as encoded pointer tokens; keys no path can name are left out.
+    /// The entries of a directory. Real directories list exactly their real
+    /// entries (minus `.fernet/` at the root), with real sizes and types,
+    /// sorted by name (invariant 3). Past directories list what existed then.
+    /// Version listings list versions oldest first, then marks. Opened files
+    /// list keys in source order, as encoded pointer tokens; keys no path can
+    /// name are left out.
     ///
     /// # Errors
     ///
-    /// [`Error::NotADirectory`] for files and scalars, I/O and parse errors.
+    /// [`Error::NotADirectory`] for files and scalars; store, I/O and parse
+    /// errors.
     pub fn list(&self, r: &Resolved) -> Result<Vec<Entry>> {
         match r {
             Resolved::RealDir { path } => {
@@ -400,6 +725,27 @@ impl Fernet {
                 }
                 out.sort();
                 Ok(out)
+            }
+            Resolved::PastDir { path, at } => {
+                let store = self.need_store(path)?;
+                let Some(rel) = self.rel(path) else {
+                    return Ok(Vec::new());
+                };
+                history::children_at(&store, &rel, *at)
+            }
+            Resolved::VersionListing { path } => {
+                let store = self.need_store(path)?;
+                let Some(rel) = self.rel(path) else {
+                    return Ok(Vec::new());
+                };
+                Ok(history::listing(&store, &rel)?
+                    .into_iter()
+                    .map(|(name, v)| Entry {
+                        name: name.into(),
+                        kind: EntryKind::File,
+                        size: v.size,
+                    })
+                    .collect())
             }
             Resolved::Inside {
                 source,
@@ -430,44 +776,58 @@ impl Fernet {
                     })
                     .collect())
             }
-            Resolved::RealFile { path } => Err(Error::NotADirectory {
-                path: self.display(path),
-            }),
+            Resolved::RealFile { path } | Resolved::PastFile { path, .. } => {
+                Err(Error::NotADirectory {
+                    path: self.display(path),
+                })
+            }
             Resolved::Inside {
                 source, pointer, ..
             } => Err(Error::NotADirectory {
                 path: self.display_inside(source, pointer),
             }),
-            Resolved::Missing => Err(Error::NotFound {
-                parent: String::new(),
-                name: String::new(),
-                inside: false,
-            }),
+            Resolved::Missing => Err(missing()),
         }
     }
 
     /// The parsed tree for `source`, or `None` if no driver handles it.
     fn tree(&self, source: &Source) -> Result<Option<Arc<Tree>>> {
-        let Source::Present(path) = source;
-        let meta = fs::metadata(path).map_err(|e| Error::io(path, e))?;
-        let key = cache::Key::present(path, &meta);
+        let key = match source {
+            Source::Present(path) => {
+                let meta = fs::metadata(path).map_err(|e| Error::io(path, e))?;
+                cache::Key::present(path, &meta)
+            }
+            Source::Past { path, version } => cache::Key::Blob {
+                path: path.clone(),
+                hash: version.hash.unwrap_or_default().0,
+            },
+        };
         if let Some(hit) = self.cache.get(&key) {
             return Ok(Some(hit));
         }
-        let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
+        let path = source.path();
+        let bytes = match source {
+            Source::Present(path) => fs::read(path).map_err(|e| Error::io(path, e))?,
+            Source::Past { path, version } => self.need_store(path)?.read(version)?,
+        };
+        Ok(self.parse_bytes(path, &bytes)?.inspect(|tree| {
+            self.cache.insert(key, Arc::clone(tree), bytes.len());
+        }))
+    }
+
+    /// Parses `bytes` with the driver for `path`; `None` if there is none.
+    pub(crate) fn parse_bytes(&self, path: &Path, bytes: &[u8]) -> Result<Option<Arc<Tree>>> {
         let head = &bytes[..bytes.len().min(fernet_fs_formats::SNIFF_LEN)];
         let Some(driver) = self.registry.detect(path, head) else {
             tracing::debug!(path = %path.display(), "no driver");
             return Ok(None);
         };
-        let tree = driver.parse(&bytes).map_err(|source| Error::Parse {
+        let tree = driver.parse(bytes).map_err(|source| Error::Parse {
             path: self.display(path),
             driver: driver.name(),
             source,
         })?;
-        let tree = Arc::new(tree);
-        self.cache.insert(key, Arc::clone(&tree), bytes.len());
-        Ok(Some(tree))
+        Ok(Some(Arc::new(tree)))
     }
 
     fn gone(&self, source: &Source, pointer: &[String]) -> Error {
@@ -479,7 +839,7 @@ impl Fernet {
     }
 
     /// `path` relative to the root, for messages.
-    fn display(&self, path: &Path) -> String {
+    pub(crate) fn display(&self, path: &Path) -> String {
         let rel = path.strip_prefix(&self.root).unwrap_or(path);
         if rel.as_os_str().is_empty() {
             ".".into()
@@ -489,13 +849,25 @@ impl Fernet {
     }
 
     fn display_inside(&self, source: &Source, pointer: &[String]) -> String {
-        let Source::Present(path) = source;
-        let mut s = format!("{}#", self.display(path));
+        let mut s = match source {
+            Source::Present(path) => format!("{}#", self.display(path)),
+            Source::Past { path, version } => {
+                format!("{}@{}#", self.display(path), time::basic_name(version.time))
+            }
+        };
         for key in pointer {
             s.push('/');
             s.push_str(&encode_token(key).unwrap_or_default());
         }
         s
+    }
+}
+
+fn missing() -> Error {
+    Error::NotFound {
+        parent: String::new(),
+        name: String::new(),
+        inside: false,
     }
 }
 

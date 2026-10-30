@@ -238,3 +238,81 @@ Messages are lowercase, name the path relative to the root, and come with a
 - Not used, despite PLAN.md: `arbitrary` and a structured path fuzz target.
   The proptest generators already cover structured paths; the string target
   checks the bijection on arbitrary input.
+
+## 22. MSRV 1.90
+
+**Context.** `redb` 4 needs Rust 1.90.
+
+**Decision.** Raise the MSRV from 1.85 to 1.90. That also brings
+`std::fs::File::try_lock` (1.89) for the store lock, so no locking crate is
+needed, and let-chains.
+
+## 23. Two index backends; readers never block on the writer
+
+**Context.** `redb` holds an exclusive lock on its file. While `fernet watch`
+(or, later, the mount) holds the store, a short-lived `fernet cat x@-1h` couldn't
+open the index.
+
+**Decision.** The process holding the store lock uses the persistent `redb`
+index in `.fernet/index/fernet.redb`. A reader that can't get the lock replays
+the log into an in-memory index instead. Both backends sit behind one trait,
+with one set of queries, and the reindex property test checks that they agree.
+Index commits use `Durability::None` and are made durable on flush: a lost index
+commit is replayed from the log on the next open. An index that is missing, from
+another format, or positioned beyond the end of the log is rebuilt.
+
+**Consequences.** Read-only opens cost a full log replay. That's fine at v0.2
+sizes; a read-only snapshot of the index can come later if needed.
+
+## 24. Record semantics the brief left open
+
+- **Ordering.** State at instant `T` is the latest record with `time ≤ T`, ties
+  broken by log order. Times needn't be monotonic in the log (clocks move).
+- **Rename** writes the new path and tombstones the old one, both at the record's
+  time.
+- **Marks** are store-wide and unique by name. Re-marking an existing name is an
+  error (`--rm` it first). Mark names follow the grammar's rules.
+- **Directories** are implicit: there are no directory records, so empty
+  directories have no history.
+- **Non-UTF-8 paths** can't be recorded (the format says UTF-8) and are not
+  captured; the present tree still lists and reads them.
+- **Identical content** is never stored twice: a snapshot whose bytes hash the
+  same as the path's latest version records nothing.
+
+## 25. Time lenses on directories
+
+**Decision.** Instants (relative, named days, absolute, marks) work on
+directories. `@first` on a directory is the earliest instant anything in it
+existed. `@~N` and `@` (listing) count versions of one file, so on directories
+they resolve to nothing. Version-listing names that collide within a second get
+`.1`, `.2` suffixes (PLAN.md Q10).
+
+## 26. `verify` never modifies the store
+
+**Decision.** `fernet verify` only reads. A torn final record in the active
+segment is a note, not a problem: the next writer truncates it. Everything else
+(bad headers, bad records anywhere else, missing or damaged blobs) is a problem,
+and the exit code is 5.
+
+## 27. Settings read with a line scan
+
+**Decision.** The store reads its few integer settings and the ignore pattern
+list from `config.toml` with a line scan rather than a TOML parser, to keep
+`fernet-fs-store` free of the `toml` crates. The file is written by fernet with
+one setting per line. Malformed values fall back to defaults. If `config.toml`
+grows nested structure, switch to `toml_edit`, which is already in the tree.
+
+## 28. The watcher
+
+**Decision.** `fernet watch` takes the writer lock, captures the whole tree once
+(recording tombstones for files that vanished while nothing was watching), then
+follows `notify` events, debounced until the tree has been quiet for 200 ms.
+Records are flushed after every batch. `notify` is built with only its macOS
+FSEvents backend feature (Linux inotify needs no feature).
+
+## 29. Extra dependencies in milestone 2
+
+- `blake3`, `zstd`, `crc32c`, `redb`, `jiff`, `notify`, `ignore`: named in the brief.
+- `similar` for `fernet diff`'s unified diffs: small, maintained, no dependencies.
+- Dev-only: `predicates` (CLI assertions); `jiff` with `tzdb-bundle-always` so
+  time-zone tests don't depend on the machine's tzdb.

@@ -15,8 +15,12 @@ workspace = true
 [dependencies]
 fernet-fs-path.workspace = true
 fernet-fs-formats.workspace = true
+fernet-fs-store.workspace = true
+ignore = "0.4"
+jiff = "0.2"
 thiserror = "2"
 tracing = "0.1"
 
 [dev-dependencies]
+jiff = { version = "0.2", features = ["tzdb-bundle-always"] }
 tempfile = "3"

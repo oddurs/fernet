@@ -5,7 +5,7 @@ members = ["crates/*", "tests"]
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/oddurs/fernet"
 homepage = "https://github.com/oddurs/fernet"

@@ -17,6 +17,8 @@ pub(crate) enum Key {
         mtime: Option<SystemTime>,
         size: u64,
     },
+    /// A blob. The path is part of the key because it picks the driver.
+    Blob { path: PathBuf, hash: [u8; 32] },
 }
 
 impl Key {
@@ -75,12 +77,13 @@ impl TreeCache {
         if size > inner.budget {
             return;
         }
-        // Drop stale versions of the same file.
-        let Key::Present { path, .. } = &key;
-        let path = path.clone();
-        inner
-            .entries
-            .retain(|(Key::Present { path: p, .. }, _, _)| *p != path);
+        // Drop stale parses of the same present file.
+        if let Key::Present { path, .. } = &key {
+            let path = path.clone();
+            inner
+                .entries
+                .retain(|(k, _, _)| !matches!(k, Key::Present { path: p, .. } if *p == path));
+        }
         inner.used = inner.entries.iter().map(|e| e.2).sum();
         while inner.used + size > inner.budget {
             let Some((_, _, freed)) = inner.entries.pop_front() else {

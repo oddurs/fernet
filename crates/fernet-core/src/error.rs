@@ -27,6 +27,31 @@ pub enum Error {
         /// The path, relative to the root.
         path: String,
     },
+    /// A file has history, but nothing at or before the requested instant.
+    #[error("no version of {path} before {before} (first kept: {first})")]
+    NoVersion {
+        /// The file, relative to the root.
+        path: String,
+        /// The requested instant, local time.
+        before: String,
+        /// The first kept version, local time.
+        first: String,
+    },
+    /// No mark by that name.
+    #[error("no mark called {name}")]
+    NoMark {
+        /// The mark.
+        name: String,
+    },
+    /// The path is in the past, or the store is open read-only.
+    #[error("{path} is read-only")]
+    ReadOnly {
+        /// The path, relative to the root.
+        path: String,
+    },
+    /// A store problem.
+    #[error(transparent)]
+    Store(#[from] fernet_fs_store::Error),
     /// Looked up a name inside a file or value.
     #[error("{path} is not a directory")]
     NotADirectory {
@@ -96,8 +121,15 @@ impl Error {
         const ENOTDIR: i32 = 20;
         const EISDIR: i32 = 21;
         const EINVAL: i32 = 22;
+        const EROFS: i32 = 30;
         match self {
-            Self::NotFound { .. } | Self::NoHistory { .. } | Self::OutsideRoot { .. } => ENOENT,
+            Self::NotFound { .. }
+            | Self::NoHistory { .. }
+            | Self::OutsideRoot { .. }
+            | Self::NoMark { .. }
+            | Self::NoVersion { .. } => ENOENT,
+            Self::ReadOnly { .. } => EROFS,
+            Self::Store(_) => EIO,
             Self::NotADirectory { .. } => ENOTDIR,
             Self::IsADirectory { .. } => EISDIR,
             Self::Parse { .. } => EINVAL,

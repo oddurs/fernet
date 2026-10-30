@@ -6,6 +6,7 @@ use std::fs;
 use std::path::Path;
 
 use assert_cmd::Command;
+use predicates::prelude::PredicateStrExt;
 
 fn fernet(dir: &Path) -> Command {
     let mut cmd = Command::cargo_bin("fernet").unwrap();
@@ -139,4 +140,186 @@ fn explicit_root() {
         .assert()
         .success()
         .stdout("a\n");
+}
+
+fn history_fixture() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    fs::write(
+        p.join("infra.yaml"),
+        "services:\n  api:\n    image: api:2.3.9\n",
+    )
+    .unwrap();
+    fs::write(p.join("notes.md"), "hello\n").unwrap();
+    fernet(p).arg("init").assert().success();
+    tmp
+}
+
+#[test]
+fn init_mark_core_log() {
+    let tmp = history_fixture();
+    let p = tmp.path();
+    fernet(p).arg("init").assert().code(2);
+    fernet(p)
+        .args(["mark", "before-migration"])
+        .assert()
+        .success();
+    fernet(p)
+        .args(["mark", "before-migration"])
+        .assert()
+        .code(3);
+    fernet(p).args(["mark", "Bad_Name"]).assert().code(3);
+    fernet(p).args(["mark", "--rm", "nope"]).assert().code(1);
+    let out = fernet(p)
+        .args(["core", "infra.yaml#/services/api/image"])
+        .env("NO_COLOR", "1")
+        .assert()
+        .success();
+    let text = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert_eq!(
+        text,
+        "──────────── tephra · before-migration ────────────\nnow         api:2.3.9\n"
+    );
+    let out = fernet(p).arg("log").assert().success();
+    let text = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(
+        text.starts_with("──────────── tephra · before-migration"),
+        "{text}"
+    );
+    assert_eq!(text.lines().count(), 3, "{text}");
+    fernet(p).args(["log", "--size"]).assert().success();
+}
+
+#[test]
+fn time_lens_reads_and_errors() {
+    let tmp = history_fixture();
+    let p = tmp.path();
+    fernet(p)
+        .args(["cat", "notes.md@first"])
+        .assert()
+        .success()
+        .stdout("hello\n");
+    fernet(p)
+        .args(["cat", "infra.yaml@~0#/services"])
+        .assert()
+        .code(1);
+    fernet(p)
+        .args(["cat", "notes.md@1999-01-01"])
+        .assert()
+        .code(1)
+        .stderr(predicate_contains(
+            "no version of notes.md before 1999-01-01",
+        ));
+    fernet(p).args(["cat", "notes.md@nomark"]).assert().code(1);
+    let out = fernet(p).args(["ls", "notes.md@"]).assert().success();
+    let names = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert_eq!(names.lines().count(), 1);
+    let version = names.trim().to_owned();
+    fernet(p)
+        .args(["cat", &format!("notes.md@/{version}")])
+        .assert()
+        .success()
+        .stdout("hello\n");
+    fernet(p)
+        .args(["diff", "notes.md@first", "notes.md"])
+        .assert()
+        .success()
+        .stdout("");
+}
+
+#[test]
+fn verify_and_reindex() {
+    let tmp = history_fixture();
+    let p = tmp.path();
+    fernet(p).arg("verify").assert().success();
+    fs::remove_dir_all(p.join(".fernet/index")).unwrap();
+    fernet(p)
+        .arg("reindex")
+        .assert()
+        .success()
+        .stdout("reindexed 2 records\n");
+    fernet(p)
+        .args(["cat", "notes.md@first"])
+        .assert()
+        .success()
+        .stdout("hello\n");
+    // Damage a blob: verify reports it and exits 5.
+    let objects = p.join(".fernet/objects");
+    let dir = fs::read_dir(&objects)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let blob = fs::read_dir(dir).unwrap().next().unwrap().unwrap().path();
+    fs::write(blob, b"garbage").unwrap();
+    fernet(p).arg("verify").assert().code(5);
+}
+
+#[test]
+fn no_store_errors() {
+    let tmp = fixture();
+    fs::remove_dir(tmp.path().join(".fernet")).unwrap();
+    fernet(tmp.path())
+        .args(["cat", "ci.yml@-1h"])
+        .assert()
+        .code(5)
+        .stderr(predicate_contains("try: fernet init"));
+    fernet(tmp.path()).arg("log").assert().code(5);
+}
+
+fn predicate_contains(s: &'static str) -> impl predicates::Predicate<[u8]> {
+    predicates::str::contains(s).from_utf8()
+}
+
+#[test]
+fn watch_captures_outside_changes() {
+    let tmp = history_fixture();
+    let p = tmp.path();
+    let bin = assert_cmd::cargo::cargo_bin("fernet");
+    let mut child = std::process::Command::new(bin)
+        .arg("watch")
+        .current_dir(p)
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // While the watcher holds the lock, writers are refused but readers work.
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    fernet(p).args(["mark", "x"]).assert().code(5);
+    fs::write(
+        p.join("infra.yaml"),
+        "services:\n  api:\n    image: api:2.4.0\n",
+    )
+    .unwrap();
+    fs::create_dir(p.join("new")).unwrap();
+    fs::write(p.join("new/file.txt"), "fresh").unwrap();
+    fs::remove_file(p.join("notes.md")).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut ok = false;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let out = fernet(p)
+            .args(["core", "infra.yaml#/services/api/image"])
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        let log = fernet(p).arg("log").output().unwrap();
+        let log = String::from_utf8_lossy(&log.stdout);
+        if String::from_utf8_lossy(&out.stdout).lines().count() == 2
+            && log.contains("new/file.txt")
+            && log.contains("deleted  notes.md")
+        {
+            ok = true;
+            break;
+        }
+    }
+    child.kill().unwrap();
+    let _ = child.wait();
+    assert!(ok, "watcher didn't capture the changes in time");
+    fernet(p)
+        .args(["cat", "infra.yaml@first#/services/api/image"])
+        .assert()
+        .success()
+        .stdout("api:2.3.9\n");
+    fernet(p).arg("verify").assert().success();
 }

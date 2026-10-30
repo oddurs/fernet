@@ -382,14 +382,13 @@ impl Registry {
     /// look binary (a NUL byte in `head`) get no driver.
     #[must_use]
     pub fn detect(&self, path: &Path, head: &[u8]) -> Option<&dyn Driver> {
-        if let Some(ext) = extension(path) {
-            if let Some(d) = self
+        if let Some(ext) = extension(path)
+            && let Some(d) = self
                 .drivers
                 .iter()
                 .find(|d| d.extensions().contains(&ext.as_str()))
-            {
-                return Some(d.as_ref());
-            }
+        {
+            return Some(d.as_ref());
         }
         if head.contains(&0) {
             return None;

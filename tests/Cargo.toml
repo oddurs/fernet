@@ -14,5 +14,7 @@ workspace = true
 fernet-fs-core.workspace = true
 fernet-fs-formats.workspace = true
 fernet-fs-path.workspace = true
+fernet-fs-store.workspace = true
+jiff = { version = "0.2", features = ["tzdb-bundle-always"] }
 proptest = "1"
 tempfile = "3"

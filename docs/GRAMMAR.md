@@ -85,16 +85,34 @@ The resolver checks the backing directory **before** reading lenses. If a real
 entry exists with the component's exact text, it is served as-is, even if that
 text contains `@` or `#`. Lenses exist only where no real entry does.
 
-## 6. Discovery and mutability
+## 6. Time lenses on files and directories
+
+- On a **file**, every form selects one kept version. `@~N` counts back from the
+  newest kept version, and `@first` is the oldest.
+- On a **directory**, an instant (relative, named day, absolute, mark) shows the
+  directory as it was then: every file that existed at that instant, and the
+  directories holding them. `@first` is the earliest instant anything below the
+  directory existed. `@~N` and the listing `@` are per-file, so on a directory
+  they match nothing.
+- Deleted files (tombstones) don't exist after their deletion, but their
+  versions stay listed under `name@`.
+- Below a time lens, names are looked up as they were at that instant, and real
+  names win there too.
+- When a file has history but nothing at or before the instant, the error says
+  so and names the first kept version.
+
+## 7. Discovery and mutability
 
 - Lenses never appear in `readdir` output; they exist only when named.
-- `ls notes.md@` lists versions, named in ISO 8601 basic format, UTC
-  (`20261030T164512Z`), plus one entry per mark covering the file.
+- `ls notes.md@` lists kept versions oldest first, named in ISO 8601 basic
+  format, UTC (`20261030T164512Z`). Versions within the same second get `.1`,
+  `.2`, … after the first. Then comes one entry per mark covering the file, named
+  after the mark. Each entry is the file at that version; `entry#` opens it.
 - `ls config.json#` lists top-level keys in source order.
 - Any path with a time lens is read-only (`EROFS`). Open-lens paths are writable
   only at the present. `.fernet/` is hidden and never writable through the mount.
 
-## 7. zsh
+## 8. zsh
 
 With `EXTENDED_GLOB`, zsh treats `#` as a glob operator. Quote fernet paths or
 use `noglob`.
