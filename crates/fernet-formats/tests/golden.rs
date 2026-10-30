@@ -4,6 +4,9 @@
 //! References: `serde_json` (with `arbitrary_precision`), `toml`, and
 //! `serde_norway` (a maintained `serde_yaml`-compatible fork).
 
+// Test helpers outside #[test] fns: failing loudly is the point.
+#![allow(clippy::unwrap_used, clippy::panic, clippy::many_single_char_names)]
+
 use std::path::{Path, PathBuf};
 
 use fernet_fs_formats::{Driver, Json, NodeId, NodeKind, Registry, ScalarType, Toml, Tree, Yaml};
