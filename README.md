@@ -14,7 +14,18 @@ fernet wraps an existing directory and exposes the same tree through a FUSE moun
 and a CLI. Your files stay plain files in a plain folder; fernet only adds names
 that don't exist there.
 
-> Status: early development (milestone 0). Nothing here works yet.
+> Status: v0.1 in progress. `fernet cat` and `fernet ls` read real files and
+> the insides of JSON (with comments), TOML and YAML. History (`@`) and the mount
+> come in later milestones.
+
+```
+$ fernet cat package.json#/scripts/build
+tsc -p tsconfig.json && vite build
+$ fernet ls docker-compose.yml#/services
+api
+db
+cache
+```
 
 ## The grammar
 

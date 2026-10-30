@@ -1,6 +1,6 @@
 # fernet — plan for milestones 0 and 1
 
-Status: **awaiting approval**. Nothing outside this file has been written yet.
+Status: **approved with the recommended defaults** (fully automatic mode). M0 and M1 are implemented; see docs/DECISIONS.md for how each question was settled.
 
 This plan covers M0 (scaffolding) and M1 (v0.1, read the depths). Section 5 lists
 questions. Each has a recommended default, so approving the plan as-is approves

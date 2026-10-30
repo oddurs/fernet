@@ -178,3 +178,63 @@ written in the test.
 JSON file, not just `.jsonc`. Strict JSON is a subset, so nothing valid is
 rejected; tsconfig and VS Code settings need both. Nesting is limited to 512
 levels in every driver.
+
+## 16. The resolver is a per-component step function
+
+**Context.** Invariant 7 says the CLI and the mount resolve identically. The
+kernel looks paths up one component at a time, and "real names win" has to be
+checked per component.
+
+**Decision.** `Fernet::lookup(parent, name)` is the only resolution primitive.
+`Fernet::resolve(&FernetPath)` folds it over the path's components printed back
+to their exact text (entry 7), and `resolve_names` does the same for raw
+`OsStr` names, so non-UTF-8 real names work. The mount (M3) will call `lookup`
+directly.
+
+**Consequences.** `Inside` nodes carry a decoded pointer, not a node id, so each
+step re-walks from the file's root through a cached tree. That's cheap (pointers
+are short) and stays correct if the file changes between lookups.
+
+## 17. A tree cache from milestone 1
+
+**Decision.** Parsed trees are cached by `(path, mtime, size)` in a bounded LRU
+(64 MiB of source by default). Brief 4.5 places it in core without a milestone;
+without it, resolving `a.json#/x/y/z` would parse the file once per component.
+Blob-hash keys arrive with the store.
+
+## 18. CLI root and paths
+
+**Decision.** The root is `--root`, else the nearest ancestor of the current
+directory holding `.fernet/`, else the current directory. Path arguments are
+relative to the current directory or absolute; `.` and `..` apply lexically and
+the result must lie inside the root (exit 2 otherwise). `.fernet` is hidden only
+at the root: a nested `.fernet` directory is ordinary user data.
+
+## 19. `#` on files no driver handles is not found
+
+**Context.** Brief §8 Q5.
+
+**Decision.** `#` on an unknown or binary format resolves to nothing (`ENOENT`,
+exit 1). A raw byte-range view can come later as an explicit driver without
+breaking anything.
+
+## 20. Error mapping
+
+**Decision.** One `fernet_fs_core::Error` enum. The mount maps it with
+`Error::errno()`; the CLI maps it to the exit codes in brief 4.7: not found → 1;
+directory/file mix-ups, unknown subcommands and paths outside the root → 2; a
+file its driver can't parse → 3; a time lens without a store → 5; other I/O → 10.
+Messages are lowercase, name the path relative to the root, and come with a
+`try:` line where there's an obvious next step.
+
+## 21. Extra dependencies in milestone 1
+
+- `thiserror` (libraries), `anyhow` and `clap` (binary): named in the brief.
+- `tracing` and `tracing-subscriber` (`env-filter`, `fmt` only): logging is
+  `tracing`, off by default, `FERNET_LOG` to enable.
+- `toml_edit` and `saphyr-parser`: entries 12 and 13.
+- Dev-only: `proptest`, `tempfile`, `assert_cmd`, `serde`, `serde_json`, `toml`,
+  `serde_norway`. The fuzz crate adds `libfuzzer-sys`.
+- Not used, despite PLAN.md: `arbitrary` and a structured path fuzz target.
+  The proptest generators already cover structured paths; the string target
+  checks the bijection on arbitrary input.
