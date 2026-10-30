@@ -316,3 +316,61 @@ FSEvents backend feature (Linux inotify needs no feature).
 - `similar` for `fernet diff`'s unified diffs: small, maintained, no dependencies.
 - Dev-only: `predicates` (CLI assertions); `jiff` with `tzdb-bundle-always` so
   time-zone tests don't depend on the machine's tzdb.
+
+## 30. The mount maps resolved nodes to inodes, nothing more
+
+**Decision.** `fernet-fs-fuse` keeps an inode table keyed by `Resolved` (which
+is `Hash` for this purpose). `lookup` calls `Fernet::lookup` once per kernel
+lookup, so invariant 7 holds by construction. Real files and directories keep
+their inode for the life of the mount; virtual nodes are dropped once the
+kernel's lookup count reaches zero. `readdir` returns the listing captured at
+`opendir`, giving each entry a stable inode without taking a lookup reference.
+
+**Consequences.** No `unsafe` was needed: `fuser` 0.18 is safe to use, and
+attributes come from `std` metadata. `statfs` reports zeros, which `df` shows as
+an empty filesystem; real numbers need `statvfs` (a dependency or `unsafe`) and
+can come with the writable mount.
+
+## 31. Real files pass through; virtual files render at open
+
+**Decision.** Reads of real files go straight to the backing file with
+`read_at`. Past files and values inside files are rendered once at `open` and
+served from that buffer, so a reader never sees a torn value even if the source
+changes mid-read. History is immutable, so past nodes get a 60 s kernel cache
+and `FOPEN_KEEP_CACHE`; present-day nodes get 1 s.
+
+## 32. Milestone 3 mounts with `ro`
+
+**Decision.** The milestone 3 mount uses the `ro` mount option, so the kernel
+returns `EROFS` for every write. `default_permissions` makes the kernel check
+access against the modes we report: real modes for real files, `0444`/`0555` for
+everything virtual. The mount opens the store in read mode. That takes the
+writer lock when it's free (one writer per store), so `fernet watch` and a
+mount don't run at the same time. In v0.4 the mount itself becomes the writer.
+
+## 33. `fernet mount` signals and `--daemon`
+
+**Decision.** SIGINT, SIGTERM and SIGHUP unmount, via the `ctrlc` crate (with
+its `termination` feature) rather than hand-written `unsafe` signal handling. If
+the filesystem is unmounted from outside (`fusermount3 -u`, `umount`), the
+command notices and exits. `--daemon` re-runs `fernet mount` in the foreground
+as a child in its own process group, with null stdio, and returns once the mount
+appears (the mountpoint's device changes). That gives a detached mount without
+`fork`. A mountpoint inside the backing directory is refused.
+
+## 34. A tree capture is one moment
+
+**Context.** `src@first` showed only the first file `snapshot_tree` captured,
+because each file got its own timestamp.
+
+**Decision.** `snapshot_tree` stamps every record of one capture (writes and
+tombstones) with the same time. `fernet init` and the watcher's first scan are
+therefore single moments in history. Single-file snapshots still use the clock
+at capture.
+
+## 35. Mount tests in CI
+
+**Decision.** The Linux test job installs `fuse3` and `ripgrep` and sets
+`FERNET_REQUIRE_FUSE=1`, which turns the mount tests' "FUSE unavailable" skip
+into a failure. Locally, without FUSE, they skip. The tests mount through the
+real `fernet mount --daemon` binary and unmount with `fusermount3 -u`.

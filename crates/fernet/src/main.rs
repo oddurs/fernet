@@ -76,6 +76,16 @@ enum Command {
     Verify,
     /// Rebuild the index from the log.
     Reindex,
+    /// Mount dir at mountpoint (read-only), in the foreground unless --daemon.
+    Mount {
+        /// The backing directory.
+        dir: PathBuf,
+        /// Where to mount it.
+        mountpoint: PathBuf,
+        /// Detach and run in the background.
+        #[arg(long)]
+        daemon: bool,
+    },
     /// Capture changes in the foreground until interrupted.
     Watch {
         /// The directory. Default: the root.
@@ -344,6 +354,14 @@ fn run(cli: &Cli) -> Result<u8, Failure> {
             let n = ctx.need_store()?.reindex().map_err(|e| store_failure(&e))?;
             writeln!(out, "reindexed {n} records")?;
         }
+        Command::Mount {
+            dir,
+            mountpoint,
+            daemon,
+        } => {
+            drop(out);
+            return mount(dir, mountpoint, *daemon);
+        }
         Command::Watch { dir } => {
             drop(out);
             return start_watch(cli, dir.as_deref());
@@ -426,6 +444,107 @@ fn start_watch(cli: &Cli, dir: Option<&Path>) -> Result<u8, Failure> {
     }
     watch(&f)?;
     Ok(0)
+}
+
+/// Whether something is mounted at `path`: its device differs from its parent's.
+fn is_mounted(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let parent = path.parent().unwrap_or(path);
+    match (std::fs::metadata(path), std::fs::metadata(parent)) {
+        (Ok(a), Ok(b)) => a.dev() != b.dev(),
+        _ => false,
+    }
+}
+
+fn mount(dir: &Path, mountpoint: &Path, daemon: bool) -> Result<u8, Failure> {
+    let mountpoint = std::fs::canonicalize(mountpoint).map_err(|e| {
+        Failure::new(
+            format!("{}: {}", mountpoint.display(), e).to_lowercase(),
+            exit::USAGE,
+        )
+    })?;
+    if daemon {
+        // Re-run in the foreground, detached from this terminal's process group.
+        use std::os::unix::process::CommandExt;
+        let exe = std::env::current_exe()?;
+        let mut child = std::process::Command::new(exe)
+            .arg("mount")
+            .arg(dir)
+            .arg(&mountpoint)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()?;
+        for _ in 0..100 {
+            if is_mounted(&mountpoint) {
+                return Ok(0);
+            }
+            if let Some(status) = child.try_wait()? {
+                return Err(
+                    Failure::new(format!("mount failed ({status})"), exit::INTERNAL).hint(format!(
+                        "fernet mount {} {}",
+                        dir.display(),
+                        mountpoint.display()
+                    )),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        return Err(Failure::new(
+            "mount didn't appear within 5 s",
+            exit::INTERNAL,
+        ));
+    }
+    let fernet = Fernet::open_with(
+        dir,
+        Options {
+            mode: Mode::Read,
+            ..Options::default()
+        },
+    )
+    .map_err(|e| failure(&e, dir.as_os_str()))?;
+    let root = fernet.root().to_owned();
+    if mountpoint.starts_with(&root) {
+        return Err(Failure::new(
+            "the mountpoint can't be inside the backing directory",
+            exit::USAGE,
+        ));
+    }
+    let session = fernet_fs_fuse::spawn(std::sync::Arc::new(fernet), &mountpoint).map_err(|e| {
+        Failure::new(
+            format!("can't mount at {}: {e}", mountpoint.display()).to_lowercase(),
+            exit::INTERNAL,
+        )
+    })?;
+    let (tx, rx) = mpsc::channel();
+    ctrlc::set_handler(move || {
+        let _ = tx.send(());
+    })
+    .map_err(|e| {
+        Failure::new(
+            format!("can't handle signals: {e}").to_lowercase(),
+            exit::INTERNAL,
+        )
+    })?;
+    let mut err = std::io::stderr().lock();
+    writeln!(
+        err,
+        "mounted {} at {}; ctrl-c to unmount",
+        root.display(),
+        mountpoint.display()
+    )?;
+    loop {
+        if rx.recv_timeout(Duration::from_millis(250)).is_ok() {
+            session.umount_and_join()?;
+            return Ok(0);
+        }
+        // Unmounted from outside (fusermount -u, umount).
+        if session.guard.is_finished() {
+            session.join()?;
+            return Ok(0);
+        }
+    }
 }
 
 fn out_flush() -> std::io::Result<()> {

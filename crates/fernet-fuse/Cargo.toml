@@ -28,3 +28,9 @@ undocumented_unsafe_blocks = "deny"
 
 [lints.rustdoc]
 broken_intra_doc_links = "deny"
+
+[dependencies]
+fernet-fs-core.workspace = true
+fernet-fs-formats.workspace = true
+fuser = "0.18"
+tracing = "0.1"

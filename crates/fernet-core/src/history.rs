@@ -247,6 +247,11 @@ impl Fernet {
     ///
     /// [`Error::NoHistory`], [`Error::ReadOnly`], store and I/O errors.
     pub fn snapshot(&self, real_path: &Path) -> Result<Option<VersionId>> {
+        self.snapshot_at(real_path, nanos(self.now()))
+    }
+
+    /// [`Fernet::snapshot`] with an explicit record time.
+    fn snapshot_at(&self, real_path: &Path, time: i64) -> Result<Option<VersionId>> {
         let path = if real_path.is_absolute() {
             real_path.to_owned()
         } else {
@@ -260,7 +265,6 @@ impl Fernet {
             return Ok(None);
         }
         let latest = store.versions(&rel)?.pop();
-        let time = nanos(self.now());
         let meta = match fs::symlink_metadata(&path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -300,17 +304,20 @@ impl Fernet {
     }
 
     /// Captures every file under `dir` (and records tombstones for files with
-    /// history that are gone). Returns how many versions were recorded.
+    /// history that are gone) as one moment: every record gets the same time,
+    /// so the tree's past state is never half-captured. Returns how many
+    /// versions were recorded.
     ///
     /// # Errors
     ///
     /// As [`Fernet::snapshot`].
     pub fn snapshot_tree(&self, dir: &Path) -> Result<usize> {
+        let time = nanos(self.now());
         let mut files = Vec::new();
         walk(self, dir, &mut files)?;
         let mut count = 0;
         for f in &files {
-            count += usize::from(self.snapshot(f)?.is_some());
+            count += usize::from(self.snapshot_at(f, time)?.is_some());
         }
         // Tombstones for vanished files.
         let gone: Vec<PathBuf> = {
@@ -331,7 +338,7 @@ impl Fernet {
             gone
         };
         for g in gone {
-            count += usize::from(self.snapshot(&g)?.is_some());
+            count += usize::from(self.snapshot_at(&g, time)?.is_some());
         }
         self.flush()?;
         Ok(count)

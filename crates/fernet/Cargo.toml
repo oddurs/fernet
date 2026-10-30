@@ -20,7 +20,9 @@ path = "src/main.rs"
 fernet-fs-core.workspace = true
 fernet-fs-path.workspace = true
 fernet-fs-store.workspace = true
+fernet-fs-fuse.workspace = true
 anyhow = "1"
+ctrlc = { version = "3", features = ["termination"] }
 jiff = "0.2"
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 similar = "2"
@@ -29,6 +31,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
+fernet-fs-core.workspace = true
+fernet-fs-store.workspace = true
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"

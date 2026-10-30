@@ -32,8 +32,16 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    env:
+      # The mount tests fail instead of skipping if FUSE is missing.
+      FERNET_REQUIRE_FUSE: "1"
     steps:
       - uses: actions/checkout@v4
+      - name: Install FUSE and ripgrep
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 ripgrep
+          ls -l /dev/fuse
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked

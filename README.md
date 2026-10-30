@@ -14,9 +14,9 @@ fernet wraps an existing directory and exposes the same tree through a FUSE moun
 and a CLI. Your files stay plain files in a plain folder; fernet only adds names
 that don't exist there.
 
-> Status: v0.1 in progress. `fernet cat` and `fernet ls` read real files and
-> the insides of JSON (with comments), TOML and YAML. History (`@`) and the mount
-> come in later milestones.
+> Status: v0.3. History is captured with `fernet init` and `fernet watch`,
+> and everything is readable through `fernet cat`/`ls` or a read-only FUSE mount
+> (`fernet mount`). Writing through `#` arrives in v0.4.
 
 ```
 $ fernet cat package.json#/scripts/build
@@ -52,6 +52,24 @@ what you get. Lenses never show up in `ls`, `find` or `rg`; they exist only wher
 you name them. Anything under `@` is read-only.
 
 The full grammar is in [docs/GRAMMAR.md](docs/GRAMMAR.md).
+
+## Commands
+
+```
+fernet init [dir]                    create .fernet/ and capture the first snowfall
+fernet watch [dir]                   capture changes until interrupted
+fernet mount <dir> <mountpoint>      mount read-only; --daemon to detach
+fernet cat <path>                    print a file, past file or value
+fernet ls <path>                     list a dir, version listing or keys
+fernet core <path>                   core sample of a file or value
+fernet log [path]                    versions, newest first; --size for store usage
+fernet mark <name> | --rm <name>     add or remove a tephra mark
+fernet diff <a> <b>                  unified diff of any two fernet paths
+fernet verify                        check log, blobs, manifest
+fernet reindex                       rebuild the index from the log
+```
+
+On macOS, see [docs/MACOS.md](docs/MACOS.md) for the mount.
 
 ## zsh and `#`
 

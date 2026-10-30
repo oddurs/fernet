@@ -71,7 +71,7 @@ impl Default for Options {
 }
 
 /// What a path resolves to.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Resolved {
     /// A regular file (or anything that isn't a directory) in the backing
     /// directory. Symlinks are followed.
