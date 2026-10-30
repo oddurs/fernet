@@ -67,3 +67,48 @@ target for 60 s in a matrix, so adding targets doesn't shrink anyone's budget.
 `unsafe_code = "deny"` instead of `forbid`, plus
 `clippy::undocumented_unsafe_blocks`. Every local `#[allow]` carries a
 justification comment.
+
+## 7. The grammar is total and bijective
+
+**Context.** "Real names win" means the resolver must check the backing directory
+for the component's exact text before it reads any lens. The parser can't know
+which names are real, so it must not reject or normalise anything.
+
+**Decision.** `Component::parse` never fails. A lens is recognised only in
+canonical spelling; anything else is a plain name. Printing is the exact inverse
+of parsing for every segment. Segments split at the **last** `@` (mark names and
+specs never contain `@`). The only path-level errors are empty, absolute, and NUL.
+
+**Rejected.** Rejecting malformed specs (`x@-02h` would become unreachable even
+when it's a real file). Normalising specs (the resolver would look up the wrong
+real name).
+
+**Consequences.** A typo in a spec reads as a missing file rather than a syntax
+error, so the CLI has to explain likely typos in its not-found messages.
+Property tests check both `parse(display(p)) == p` and `display(parse(s)) == s`.
+
+## 8. `TimeSpec::Relative { amount, unit }` instead of `Relative(Duration)`
+
+**Context.** Brief 4.2 has `Relative(Duration)`. A `Duration` can't tell
+`@-120m` from `@-2h`, so it couldn't print back what was written (entry 7).
+
+**Decision.** Store the amount and unit; `TimeSpec::duration()` converts. Amounts
+whose duration overflows `u64` seconds are not specs. `AbsoluteTime` likewise keeps
+the written precision, and `-00:00` stays distinct from `+00:00`.
+
+## 9. Pointer-token extension for unnameable keys
+
+**Context.** The kernel never delivers `""`, `.` or `..` as names, but JSON allows
+them as keys.
+
+**Decision.** Whole-token forms `~e`, `~.` and `~..`. RFC 6901 forbids `~`
+followed by anything but `0` or `1`, so this can't clash with a standard pointer.
+Keys with NUL or an encoded length over 255 bytes are left out of listings.
+
+## 10. Lens placement: one of each, time first
+
+**Context.** Brief 2.1 says "one component may carry lenses", but section 1 shows
+`src@2026-10-01/` with paths beneath it.
+
+**Decision.** At most one time lens and one open lens apply, the time lens on the
+open component or before it. Later lens-shaped segments are literal.
