@@ -79,6 +79,12 @@ enum Command {
         /// The new side.
         b: OsString,
     },
+    /// Apply the retention policy: thin old versions, keep marks.
+    Compact {
+        /// Report what would happen without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Check the log, blobs and manifest.
     Verify,
     /// Rebuild the index from the log.
@@ -381,6 +387,7 @@ fn run(cli: &Cli) -> Result<u8, Failure> {
         }
         Command::Diff { a, b } => diff(cli, a, b, &mut out)?,
         Command::Verify => return verify(cli, &mut out),
+        Command::Compact { dry_run } => compact(cli, *dry_run, &mut out)?,
         Command::Reindex => {
             let ctx = Ctx::open(cli, Mode::Write)?;
             let n = ctx.need_store()?.reindex().map_err(|e| store_failure(&e))?;
@@ -643,6 +650,25 @@ fn write(ctx: &Ctx, arg: &OsStr, value: &str) -> Result<(), Failure> {
         }),
     };
     res.map_err(|e| failure(&e, arg))
+}
+
+fn compact(cli: &Cli, dry_run: bool, out: &mut impl Write) -> Result<(), Failure> {
+    let ctx = Ctx::open(cli, Mode::Write)?;
+    let now = fernet_fs_core::time::nanos(ctx.fernet.now());
+    let r = ctx
+        .need_store()?
+        .compact(now, dry_run)
+        .map_err(|e| store_failure(&e))?;
+    let dropped = r.records_before - r.records_after;
+    let verb = if dry_run { "would drop" } else { "dropped" };
+    writeln!(
+        out,
+        "{verb} {dropped} of {} records and {} blobs ({})",
+        r.records_before,
+        r.blobs_removed,
+        style::size(r.bytes_freed)
+    )?;
+    Ok(())
 }
 
 fn out_flush() -> std::io::Result<()> {

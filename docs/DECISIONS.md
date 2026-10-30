@@ -466,3 +466,17 @@ the first log line from a filesystem thread deadlocked the mount.
 
 **Decision.** The mount prints its banner with `eprintln!` and holds no lock.
 Tracing calls in the FUSE layer are cheap and safe to keep.
+
+## 42. Compaction
+
+**Decision.** `Store::compact` plans with a pure function (`compact::plan`:
+records + now + policy → kept positions), then rewrites: new segments
+(unlisted, so ignored until committed), an atomic manifest swap (the commit
+point), retired segments deleted, unreferenced blobs deleted, index rebuilt.
+Buckets are UTC hours, days and weeks counted from the epoch. A `rename` is kept
+if either side keeps it, which can keep slightly more history than the policy
+asks for, never less. Compaction needs the writer lock. While a mount or watcher
+runs, `fernet compact` reports the store as busy. A test hook (`CrashAfter(n)`)
+stops after any step. The crash test runs every stopping point and checks that
+the reopened store verifies and holds exactly the old history or exactly the
+planned one.

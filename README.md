@@ -14,9 +14,16 @@ fernet wraps an existing directory and exposes the same tree through a FUSE moun
 and a CLI. Your files stay plain files in a plain folder; fernet only adds names
 that don't exist there.
 
-> Status: v0.3. History is captured with `fernet init` and `fernet watch`,
-> and everything is readable through `fernet cat`/`ls` or a read-only FUSE mount
-> (`fernet mount`). Writing through `#` arrives in v0.4.
+> Status: v0.4. History is captured with `fernet init`, `fernet watch` or a
+> mount. Values inside JSON, TOML and YAML files are readable and writable
+> through `#`, from the CLI or the FUSE mount.
+
+```
+$ echo 9090 > 'mnt/config.json#/server/port'      # a byte splice: nothing else moves
+$ mkdir 'mnt/config.json#/limits'                   # inserts {}
+$ cat 'mnt/config.json@~1#/server/port'
+8080
+```
 
 ```
 $ fernet cat package.json#/scripts/build
@@ -58,13 +65,15 @@ The full grammar is in [docs/GRAMMAR.md](docs/GRAMMAR.md).
 ```
 fernet init [dir]                    create .fernet/ and capture the first snowfall
 fernet watch [dir]                   capture changes until interrupted
-fernet mount <dir> <mountpoint>      mount read-only; --daemon to detach
+fernet mount <dir> <mountpoint>      mount (writable); --read-only, --daemon
+fernet write <path> [value|-]        set a value (stdin with -)
 fernet cat <path>                    print a file, past file or value
 fernet ls <path>                     list a dir, version listing or keys
 fernet core <path>                   core sample of a file or value
 fernet log [path]                    versions, newest first; --size for store usage
 fernet mark <name> | --rm <name>     add or remove a tephra mark
 fernet diff <a> <b>                  unified diff of any two fernet paths
+fernet compact [--dry-run]           apply the retention policy
 fernet verify                        check log, blobs, manifest
 fernet reindex                       rebuild the index from the log
 ```

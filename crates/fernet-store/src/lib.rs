@@ -18,6 +18,7 @@
 //! the index is disposable (invariant 5).
 #![forbid(unsafe_code)]
 
+pub mod compact;
 mod index;
 mod objects;
 pub mod record;
@@ -189,7 +190,7 @@ pub enum Mode {
     Read,
 }
 
-struct Active {
+pub(crate) struct Active {
     file: File,
     id: u64,
     len: u64,
@@ -775,6 +776,13 @@ segment_bytes = 67108864
 [capture]
 # A path is captured once it has been quiet this long (mount and watch).
 debounce_ms = 2000
+
+[retention]
+# Compaction keeps every version younger than snow_hours, the latest per hour
+# until firn_days, the latest per day until ice_days, then the latest per week.
+snow_hours = 24
+firn_days = 30
+ice_days = 365
 
 [limits]
 # Files larger than this aren't captured.

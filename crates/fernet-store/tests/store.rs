@@ -273,3 +273,193 @@ fn writer_lock_is_exclusive() {
     ));
     assert!(Store::open(tmp.path(), Mode::Read).is_ok());
 }
+
+mod compaction {
+    use super::*;
+    use fernet_fs_store::compact::{CrashAfter, Policy, plan};
+
+    const HOUR: i64 = 3_600 * 1_000_000_000;
+    const DAY: i64 = 24 * HOUR;
+    const NOW: i64 = 500 * DAY;
+
+    /// A store with a long, dense history across every retention layer, two
+    /// files, a live mark and a removed one. Segments are small so compaction
+    /// writes several.
+    fn aged_store() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        drop(Store::init(tmp.path()).unwrap());
+        let config = tmp.path().join(".fernet/config.toml");
+        let text = fs::read_to_string(&config)
+            .unwrap()
+            .replace("segment_bytes = 67108864", "segment_bytes = 2048");
+        fs::write(&config, text).unwrap();
+        let mut s = Store::open(tmp.path(), Mode::Write).unwrap();
+        let mut t = NOW - 450 * DAY;
+        let mut i = 0u32;
+        while t < NOW {
+            let path = if i.is_multiple_of(3) {
+                "b.txt"
+            } else {
+                "a.txt"
+            };
+            write(&mut s, path, format!("v{i}").as_bytes(), t);
+            if i == 40 {
+                s.append(&Record {
+                    kind: Kind::Mark,
+                    time: t + 1,
+                    path: String::new(),
+                    hash: Hash::ZERO,
+                    size: 0,
+                    extra: "keep-me".into(),
+                })
+                .unwrap();
+            }
+            if i == 50 {
+                s.append(&Record {
+                    kind: Kind::Mark,
+                    time: t + 1,
+                    path: String::new(),
+                    hash: Hash::ZERO,
+                    size: 0,
+                    extra: "temp".into(),
+                })
+                .unwrap();
+                s.append(&Record {
+                    kind: Kind::Unmark,
+                    time: t + 2,
+                    path: String::new(),
+                    hash: Hash::ZERO,
+                    size: 0,
+                    extra: "temp".into(),
+                })
+                .unwrap();
+            }
+            // Denser towards the present: every 3 days, then hours, then minutes.
+            let age = NOW - t;
+            t += if age > 30 * DAY {
+                3 * DAY
+            } else if age > DAY {
+                5 * HOUR
+            } else {
+                20 * 60 * 1_000_000_000
+            };
+            i += 1;
+        }
+        s.flush().unwrap();
+        tmp
+    }
+
+    fn contents(s: &Store) -> Vec<Record> {
+        s.records().unwrap().into_iter().map(|(_, r)| r).collect()
+    }
+
+    #[test]
+    fn compaction_keeps_what_the_policy_promises() {
+        let tmp = aged_store();
+        let mut s = Store::open(tmp.path(), Mode::Write).unwrap();
+        let before = s.records().unwrap();
+        let keep = plan(&before, NOW, &Policy::default());
+        let report = s
+            .compact_with(NOW, &Policy::default(), false, None)
+            .unwrap();
+        assert_eq!(report.records_before as usize, before.len());
+        assert!(report.records_after < report.records_before, "{report:?}");
+        assert!(report.blobs_removed > 0);
+        let after = contents(&s);
+        let want: Vec<Record> = before
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| keep.contains(i))
+            .map(|(_, (_, r))| r.clone())
+            .collect();
+        assert_eq!(after, want);
+        // The newest version of each file and everything under 24 h survive.
+        for p in ["a.txt", "b.txt"] {
+            let newest = before.iter().rev().find(|(_, r)| r.path == p).unwrap();
+            assert!(after.contains(&newest.1));
+        }
+        for (_, r) in &before {
+            if NOW - r.time < DAY {
+                assert!(after.contains(r), "snow-layer record dropped: {r:?}");
+            }
+        }
+        // The live mark and the version it points at survive; the removed one doesn't.
+        assert!(s.marks().unwrap().contains_key("keep-me"));
+        assert!(!after.iter().any(|r| r.extra == "temp"));
+        let mark_t = s.marks().unwrap()["keep-me"];
+        for p in ["a.txt", "b.txt"] {
+            let pointed = before
+                .iter()
+                .rfind(|(_, r)| r.path == p && r.time <= mark_t)
+                .unwrap();
+            assert!(after.contains(&pointed.1));
+        }
+        // Every kept blob is still there; the store verifies; it reopens.
+        drop(s);
+        assert!(verify(tmp.path()).unwrap().ok());
+        let s = Store::open(tmp.path(), Mode::Write).unwrap();
+        assert_eq!(contents(&s), want);
+        // A dry run changes nothing.
+        let mut s = s;
+        let dry = s.compact_with(NOW, &Policy::default(), true, None).unwrap();
+        assert_eq!(dry.records_before, dry.records_after);
+        assert_eq!(contents(&s), want);
+    }
+
+    #[test]
+    fn a_crash_at_any_step_leaves_a_valid_store() {
+        let tmp = aged_store();
+        let (before, want) = {
+            let s = Store::open(tmp.path(), Mode::Write).unwrap();
+            let before = s.records().unwrap();
+            let keep = plan(&before, NOW, &Policy::default());
+            let want: Vec<Record> = before
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| keep.contains(i))
+                .map(|(_, (_, r))| r.clone())
+                .collect();
+            (before.into_iter().map(|(_, r)| r).collect::<Vec<_>>(), want)
+        };
+        let mut finished = false;
+        let mut crash = 0;
+        while !finished {
+            let work = tempfile::tempdir().unwrap();
+            copy_dir(&tmp.path().join(".fernet"), &work.path().join(".fernet"));
+            {
+                let mut s = Store::open(work.path(), Mode::Write).unwrap();
+                finished = s
+                    .compact_with(NOW, &Policy::default(), false, Some(CrashAfter(crash)))
+                    .is_ok();
+            }
+            // Reopen as a fresh process would.
+            let report = verify(work.path()).unwrap();
+            assert!(
+                report.ok(),
+                "crash after step {crash}: {:?}",
+                report.problems
+            );
+            let s = Store::open(work.path(), Mode::Write)
+                .unwrap_or_else(|e| panic!("crash after step {crash}: {e}"));
+            let got = contents(&s);
+            assert!(
+                got == before || got == want,
+                "crash after step {crash}: history is neither before nor after"
+            );
+            // Queries still answer from whichever state is live.
+            for p in ["a.txt", "b.txt"] {
+                let v = s.version_at(p, NOW).unwrap().unwrap();
+                assert!(
+                    s.read(&v).is_ok(),
+                    "crash after step {crash}: newest {p} unreadable"
+                );
+            }
+            crash += 1;
+            assert!(crash < 10_000);
+        }
+        assert!(
+            crash > 5,
+            "compaction should have several steps, had {crash}"
+        );
+    }
+}

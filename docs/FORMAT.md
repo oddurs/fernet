@@ -128,16 +128,39 @@ TOML. Settings fernet reads (anything else is ignored):
 | --- | --- | --- | --- |
 | `[log]` | `group_commit_ms` | 50 | maximum fsync interval for records |
 | `[log]` | `segment_bytes` | 67108864 | roll segments at this size |
+| `[capture]` | `debounce_ms` | 2000 | a path is captured once quiet this long |
+| `[retention]` | `snow_hours` | 24 | compaction keeps every version younger than this |
+| `[retention]` | `firn_days` | 30 | then the latest per hour until this age |
+| `[retention]` | `ice_days` | 365 | then the latest per day until this age; the latest per week after |
 | `[limits]` | `max_file_size` | 52428800 | files larger than this aren't captured |
 | `[ignore]` | `patterns` | `[]` | extra gitignore-style patterns |
 
-## 8. Index
+## 8. Compaction
+
+Compaction is the only process that removes records (invariant 2). It is a
+rewrite, never an edit:
+
+1. Choose the records to keep. For each path, keep the newest record, the latest
+   record at or before each live mark's time, every record younger than
+   `snow_hours`, and the latest record in each hour, day or week bucket (UTC,
+   by age as in section 7). Keep each live mark's latest `mark` record. Drop
+   `unmark` records and the marks they removed. A `rename` is kept if either of
+   its paths keeps it.
+2. Write the kept records, in their original order, into new segments numbered
+   after the highest live id, each written and fsynced as in section 3.
+3. Replace `MANIFEST` with the new ids only. This is the commit point.
+4. Delete the retired segment files, then any blob no kept record names.
+
+A reader that finds unlisted segments or unreferenced blobs ignores them. They
+are what an interrupted compaction leaves behind.
+
+## 9. Index
 
 `index/` holds derived lookup tables and can be deleted at any time
 (invariant 5). It isn't part of the format; readers should ignore it and replay
 the log.
 
-## 9. Lock
+## 10. Lock
 
 `lock` is an empty file. A writer holds an exclusive advisory lock on it
 (`flock`) for as long as it may append. Readers don't need it.
