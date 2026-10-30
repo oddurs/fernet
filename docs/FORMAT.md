@@ -1,9 +1,16 @@
 # fernet store format
 
-Status: **draft, version 1** (milestone 2). This document describes everything a
-reader needs to recover history from a store. It becomes frozen at v1.0
-(invariant 6). Until then it may change, but every change lands in the same
-commit as the code.
+Status: **stable. Format version 1, frozen at fernet 1.0** (invariant 6).
+
+This document describes everything a reader needs to recover every version from
+a store. `tools/format-reader/` is an independent reader written from this
+document alone; its test recovers every version of the committed fixture store
+`tests/fixtures/store-v1`.
+
+**Compatibility promise.** Every later fernet reads version 1 stores. A change
+to anything here needs a new `FORMAT` line (`fernet-store 2`), and fernet keeps
+reading `fernet-store 1`. Additions that old readers can safely ignore (new
+`config.toml` keys, new files that aren't listed here) don't change the version.
 
 All integers are little-endian. All text is UTF-8. "Fsync" means a durable
 flush of a file's contents (`fsync`/`F_FULLFSYNC`); "fsync the directory" means
@@ -25,6 +32,7 @@ The store lives in `.fernet/` at the root of the backing directory:
 └── lock            advisory lock
 ```
 
+Paths in this document are relative to `.fernet/` unless they start with it.
 A directory without `FORMAT` is not a store. `FORMAT` is written last on
 creation, so a half-created store is never opened. A reader that sees any other
 `FORMAT` content must refuse the store.

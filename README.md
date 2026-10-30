@@ -14,7 +14,7 @@ fernet wraps an existing directory and exposes the same tree through a FUSE moun
 and a CLI. Your files stay plain files in a plain folder; fernet only adds names
 that don't exist there.
 
-> Status: v0.5. History is captured with `fernet init`, `fernet watch` or a
+> Status: 1.0. History is captured with `fernet init`, `fernet watch` or a
 > mount. Values inside JSON, TOML, YAML, Markdown and CSV files are readable
 > and writable through `#`; SQLite databases, zip and tar archives are
 > readable.
@@ -59,7 +59,9 @@ Real names always win: if a file is literally called `user@example.com`, that's
 what you get. Lenses never show up in `ls`, `find` or `rg`; they exist only where
 you name them. Anything under `@` is read-only.
 
-The full grammar is in [docs/GRAMMAR.md](docs/GRAMMAR.md).
+The full grammar is in [docs/GRAMMAR.md](docs/GRAMMAR.md). The user guide starts at
+[docs/guide/index.md](docs/guide/index.md); the on-disk format is the frozen
+spec in [docs/FORMAT.md](docs/FORMAT.md).
 
 ## Commands
 

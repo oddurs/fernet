@@ -410,8 +410,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
+name = "fernet-format-reader"
+version = "1.0.0"
+dependencies = [
+ "blake3",
+ "crc32c",
+ "zstd",
+]
+
+[[package]]
 name = "fernet-fs"
-version = "0.0.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -432,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "fernet-fs-core"
-version = "0.0.0"
+version = "1.0.0"
 dependencies = [
  "fernet-fs-formats",
  "fernet-fs-path",
@@ -446,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "fernet-fs-formats"
-version = "0.0.0"
+version = "1.0.0"
 dependencies = [
  "csv",
  "proptest",
@@ -465,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "fernet-fs-fuse"
-version = "0.0.0"
+version = "1.0.0"
 dependencies = [
  "fernet-fs-core",
  "fernet-fs-formats",
@@ -478,14 +487,14 @@ dependencies = [
 
 [[package]]
 name = "fernet-fs-path"
-version = "0.0.0"
+version = "1.0.0"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "fernet-fs-store"
-version = "0.0.0"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -499,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "fernet-tests"
-version = "0.0.0"
+version = "1.0.0"
 dependencies = [
  "fernet-fs-core",
  "fernet-fs-formats",

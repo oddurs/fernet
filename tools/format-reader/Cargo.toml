@@ -1,0 +1,13 @@
+[package]
+name = "fernet-format-reader"
+description = "A minimal reader for fernet stores, written only from docs/FORMAT.md."
+version = "1.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Deliberately independent of every fernet crate: it proves FORMAT.md is enough.
+[dependencies]
+blake3 = "1"
+crc32c = "0.6"
+zstd = "0.14"

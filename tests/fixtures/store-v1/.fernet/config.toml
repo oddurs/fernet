@@ -1,0 +1,30 @@
+# fernet store settings.
+
+[log]
+# Records are fsynced in groups, at most this often.
+group_commit_ms = 50
+
+# Segments roll over at this size.
+segment_bytes = 67108864
+
+[capture]
+# A path is captured once it has been quiet this long (mount and watch).
+debounce_ms = 2000
+
+[retention]
+# Compaction keeps every version younger than snow_hours, the latest per hour
+# until firn_days, the latest per day until ice_days, then the latest per week.
+snow_hours = 24
+firn_days = 30
+ice_days = 365
+
+[limits]
+# Files larger than this aren't captured.
+max_file_size = 52428800
+# Warn when the store grows past this many bytes (log, watch, mount).
+store_warn_bytes = 1073741824
+
+[ignore]
+# Extra gitignore-style patterns, on top of .fernetignore and the defaults
+# (.git/, node_modules/, target/, .DS_Store).
+patterns = []

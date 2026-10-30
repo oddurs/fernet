@@ -66,6 +66,11 @@ pub struct FernetFs {
     next_fh: AtomicU64,
     uid: u32,
     gid: u32,
+    /// Kernel passthrough (Linux 6.9+, needs `CAP_SYS_ADMIN`): reads and
+    /// writes of real files go straight to the backing file.
+    passthrough: std::sync::atomic::AtomicBool,
+    /// Backing ids per inode, shared by its open handles.
+    backing: Mutex<HashMap<u64, (Arc<fuser::BackingId>, usize)>>,
 }
 
 enum Handle {
@@ -74,6 +79,8 @@ enum Handle {
         file: File,
         path: PathBuf,
         written: bool,
+        ino: u64,
+        passthrough: bool,
     },
     /// Rendered bytes of a read-only virtual file.
     Bytes(Arc<Vec<u8>>),
@@ -277,6 +284,8 @@ impl FernetFs {
             next_fh: AtomicU64::new(1),
             uid,
             gid,
+            passthrough: std::sync::atomic::AtomicBool::new(false),
+            backing: Mutex::new(HashMap::new()),
         }
     }
 
@@ -544,6 +553,47 @@ impl FernetFs {
         }
     }
 
+    /// The passthrough backing id for `ino`, shared by its open handles.
+    /// `None` when passthrough is off or the kernel refuses (then it's turned
+    /// off for the rest of the mount).
+    fn backing_for(
+        &self,
+        ino: u64,
+        reply: &ReplyOpen,
+        file: &File,
+    ) -> Option<Arc<fuser::BackingId>> {
+        if !self.passthrough.load(Ordering::Relaxed) {
+            return None;
+        }
+        let mut map = self.backing.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((id, count)) = map.get_mut(&ino) {
+            *count += 1;
+            return Some(Arc::clone(id));
+        }
+        match reply.open_backing(file) {
+            Ok(id) => {
+                let id = Arc::new(id);
+                map.insert(ino, (Arc::clone(&id), 1));
+                Some(id)
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "passthrough unavailable; using the page cache");
+                self.passthrough.store(false, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    fn release_backing(&self, ino: u64) {
+        let mut map = self.backing.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, count)) = map.get_mut(&ino) {
+            *count -= 1;
+            if *count == 0 {
+                map.remove(&ino);
+            }
+        }
+    }
+
     /// Captures everything pending now (for tests and clean unmounts).
     pub fn flush_history(&self) {
         if let Some(c) = &self.capture {
@@ -557,6 +607,19 @@ impl Filesystem for FernetFs {
         // Pass O_TRUNC to open instead of a separate truncate, so `echo x >
         // file#/key` arrives as one open-write-close on a fresh buffer.
         let _ = config.add_capabilities(fuser::InitFlags::FUSE_ATOMIC_O_TRUNC);
+        // Real files keep their page cache across opens (FOPEN_KEEP_CACHE);
+        // the kernel drops it when a file's mtime or size changes, including
+        // changes made outside the mount.
+        let _ = config.add_capabilities(fuser::InitFlags::FUSE_AUTO_INVAL_DATA);
+        // Passthrough when the kernel offers it; the page cache otherwise.
+        if std::env::var_os("FERNET_NO_PASSTHROUGH").is_none()
+            && config
+                .add_capabilities(fuser::InitFlags::FUSE_PASSTHROUGH)
+                .is_ok()
+        {
+            let _ = config.set_max_stack_depth(2);
+            self.passthrough.store(true, Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -895,17 +958,30 @@ impl Filesystem for FernetFs {
                     .write(write)
                     .truncate(trunc && write)
                     .open(path);
-                match res {
-                    Ok(file) => {
-                        let fh = self.new_handle(Handle::Real {
-                            file,
-                            path: path.clone(),
-                            written: trunc && write,
-                        });
-                        reply.opened(fh, FopenFlags::empty());
-                    }
-                    Err(e) => reply.error(Errno::from(e)),
+                let file = match res {
+                    Ok(f) => f,
+                    Err(e) => return reply.error(Errno::from(e)),
+                };
+                if let Some(id) = self.backing_for(ino.0, &reply, &file) {
+                    // Writes bypass us under passthrough: assume a writable
+                    // handle wrote, so release snapshots it.
+                    let fh = self.new_handle(Handle::Real {
+                        file,
+                        path: path.clone(),
+                        written: write,
+                        ino: ino.0,
+                        passthrough: true,
+                    });
+                    return reply.opened_passthrough(fh, FopenFlags::empty(), &id);
                 }
+                let fh = self.new_handle(Handle::Real {
+                    file,
+                    path: path.clone(),
+                    written: trunc && write,
+                    ino: ino.0,
+                    passthrough: false,
+                });
+                reply.opened(fh, FopenFlags::FOPEN_KEEP_CACHE);
             }
             Resolved::Inside {
                 node: NodeKind::Scalar(_),
@@ -977,6 +1053,8 @@ impl Filesystem for FernetFs {
                     file,
                     path: p,
                     written: true,
+                    ino,
+                    passthrough: false,
                 });
                 match self.attr(ino, &r) {
                     Ok((attr, ttl)) => {
@@ -1174,11 +1252,18 @@ impl Filesystem for FernetFs {
             .remove(&fh.0);
         if let Some(Handle::Real {
             path,
-            written: true,
+            written,
+            ino,
+            passthrough,
             ..
         }) = handle
         {
-            self.touch(&path);
+            if passthrough {
+                self.release_backing(ino);
+            }
+            if written {
+                self.touch(&path);
+            }
         }
         match res {
             Ok(()) => reply.ok(),

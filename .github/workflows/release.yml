@@ -1,0 +1,62 @@
+name: release
+
+# Tags `v*` build and publish a GitHub release. A manual run builds the same
+# binaries as workflow artifacts without publishing anything.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: macFUSE headers (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install pkgconf
+          brew install --cask macfuse
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: cargo build --release --locked -p fernet-fs
+      - name: Package
+        shell: bash
+        run: |
+          name="fernet-${GITHUB_REF_NAME//\//-}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp target/release/fernet README.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          mkdir -p "dist/$name/completions"
+          for sh in bash zsh fish; do target/release/fernet completions "$sh" > "dist/$name/completions/fernet.$sh"; done
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz*
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

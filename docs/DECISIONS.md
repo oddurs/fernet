@@ -541,3 +541,45 @@ when the store's log, blobs and index together pass it.
 
 `pulldown-cmark`, `csv`, `rusqlite`, `zip` and `tar` are named in the brief.
 Nothing else was added.
+
+## 49. Reading real files at native speed through the mount
+
+**Context.** Brief 6: `cat` through the mount within 10% of the backing
+filesystem. Plain FUSE reads cost about 1.5x.
+
+**Decision.** Two layers.
+1. **Passthrough** (Linux 6.9+, `CAP_SYS_ADMIN`): real-file opens register the
+   backing fd (`FUSE_PASSTHROUGH`, one backing id per inode shared by its open
+   handles), and the kernel reads and writes the backing file directly.
+   Measured 0.91–1.03x. Writes bypass the daemon under passthrough, so a
+   writable handle is assumed written and its release triggers a capture.
+2. **Page cache** otherwise: real files open with `FOPEN_KEEP_CACHE`, and
+   `FUSE_AUTO_INVAL_DATA` drops cached pages when a file's mtime or size
+   changes (including outside the mount). Measured 1.03x through Python's
+   read, 1.15–1.20x through `std::fs::read`.
+
+If registering a backing fd fails, passthrough is turned off for the rest of the
+mount. `FERNET_NO_PASSTHROUGH=1` forces the page-cache path, and the mount
+tests run both ways.
+
+**Consequences.** On kernels without passthrough the 10% target isn't met in
+every measurement. The CI benchmark job reports rather than gates (GitHub's
+runners are shared and run older kernels).
+
+## 50. 1.0
+
+**Decision.** The workspace is version 1.0.0. FORMAT.md is stable (format
+version 1) with a written compatibility promise. `tests/fixtures/store-v1` is
+committed, and two tests read it: the current store code
+(`tests/tests/fixture_store.rs`) and the independent reader
+(`tools/format-reader`, 172 lines, depending only on `blake3`, `crc32c` and
+`zstd`).
+
+## 51. Releases
+
+**Decision.** `.github/workflows/release.yml` builds `fernet` for
+x86_64-linux, aarch64-linux (a native arm runner) and aarch64-macos (with
+macFUSE headers). It packages each with the licenses, README and completion
+scripts plus a SHA-256. Tags `v*` publish a GitHub release; a manual run only
+uploads artifacts. No tag has been pushed: publishing 1.0 is the maintainer's
+call.
