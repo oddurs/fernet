@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "tests"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/oddurs/fernet"
+homepage = "https://github.com/oddurs/fernet"
+authors = ["fernet contributors"]
+
+[workspace.dependencies]
+fernet-fs-path = { path = "crates/fernet-path", version = "0.0.0" }
+fernet-fs-formats = { path = "crates/fernet-formats", version = "0.0.0" }
+fernet-fs-store = { path = "crates/fernet-store", version = "0.0.0" }
+fernet-fs-core = { path = "crates/fernet-core", version = "0.0.0" }
+fernet-fs-fuse = { path = "crates/fernet-fuse", version = "0.0.0" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+dbg_macro = "deny"
+todo = "deny"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

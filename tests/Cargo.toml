@@ -1,0 +1,13 @@
+[package]
+name = "fernet-tests"
+description = "Cross-crate integration tests for fernet."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dev-dependencies]

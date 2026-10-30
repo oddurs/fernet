@@ -1,0 +1,5 @@
+# Pinned for reproducible clippy and rustfmt. The MSRV is `rust-version` in
+# Cargo.toml and is checked separately in CI (docs/DECISIONS.md, entry 3).
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]

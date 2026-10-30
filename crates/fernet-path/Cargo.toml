@@ -1,0 +1,13 @@
+[package]
+name = "fernet-fs-path"
+description = "The fernet path grammar: time (@) and depth (#) lenses on ordinary paths."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true

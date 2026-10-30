@@ -1,0 +1,13 @@
+[package]
+name = "fernet-fs-core"
+description = "The fernet resolver shared by the mount and the CLI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
