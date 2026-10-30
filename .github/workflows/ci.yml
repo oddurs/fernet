@@ -75,7 +75,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [path_parse, json_parse, toml_parse, yaml_parse, segment_scan]
+        target: [path_parse, json_parse, toml_parse, yaml_parse, segment_scan, markdown_parse, csv_parse, sqlite_parse, zip_parse, tar_parse]
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install nightly --profile minimal

@@ -480,3 +480,64 @@ runs, `fernet compact` reports the store as busy. A test hook (`CrashAfter(n)`)
 stops after any step. The crash test runs every stopping point and checks that
 the reopened store verifies and holds exactly the old history or exactly the
 planned one.
+
+## 43. Markdown mapping details
+
+**Decision.** Headings (ATX and setext) become directories, nested by level. A
+section's text from the end of its heading line to the next heading of any
+level is its `body` file. The root has a `body` too: the text before the first
+heading. Duplicate headings get ` (2)`, ` (3)`…; a heading named `body` becomes
+`body (2)`. A body's value is its slice minus one trailing newline (the file
+adds it back), so reading and writing back is byte-identical. Writes are
+splices checked by re-parsing: a body that would create or remove a heading is
+refused. `mkdir`/new names append a heading one level below their parent at the
+end of its section; `rm` removes a section with its subsections; `rm body`
+empties it. Only the extension (`.md`, `.markdown`, …) selects the driver;
+plain text sniffs too much like Markdown.
+
+## 44. CSV mapping details
+
+**Decision.** The first row is the header. Rows are directories `0`, `1`, …,
+each holding its fields by header name. Every value is a string. Field spans
+come from our own RFC 4180 scanner, and the golden test checks it against the
+`csv` crate. Writes re-quote only when needed (or when the field was quoted),
+and an empty sole field is written `""` so its row doesn't become a blank line.
+New rows are appended (`mkdir people.csv#/3`); rows can be removed; columns are
+fixed. Keying rows by a column (brief 4.3) is deferred: it needs per-file
+configuration, which the driver interface doesn't have yet.
+
+## 45. SQLite, zip and tar
+
+**Decision.**
+- **`SQLite`**, through `rusqlite` (bundled SQLite, `serialize` feature),
+  deserialized read-only into memory with `trusted_schema` off. Tables are
+  directories (sorted). Rows are keyed by the primary key when there is exactly
+  one primary-key column, else by `rowid`, else (composite `WITHOUT ROWID`) by
+  position. Blobs are raw bytes.
+- **Zip and tar**: the archive's own tree, with files as raw bytes. Total
+  uncompressed size is capped at 256 MiB (zip bombs). Only uncompressed tar is
+  read; `.tar.gz` would need another decompressor and is deferred. `zip` is
+  built with only its deflate backend.
+- `ScalarType::Bytes` and `Node::raw` carry binary content, which renders
+  without a trailing newline. The registry lets only these three binary drivers
+  sniff heads that contain NUL bytes.
+
+## 46. Shell completions
+
+**Decision.** `fernet completions bash|zsh|fish` prints a small script. For
+path arguments it calls the hidden `fernet complete -- <word>`, which uses the
+real resolver: directory entries and keys (after `#/`), `name#` → `name#/`,
+and after `@` the listing (`@/`), `first`, `~1`, `-1h`, `-1d`, the named days
+and the store's marks. Completion never fails loudly. `clap_complete` isn't
+used: the dynamic part is the whole point, and the scripts are a few lines.
+
+## 47. Store size warning
+
+**Decision.** `[limits] store_warn_bytes` (default 1 GiB). `fernet log`,
+`fernet watch` and `fernet mount` print a warning with `try: fernet compact`
+when the store's log, blobs and index together pass it.
+
+## 48. Extra dependencies in milestone 5
+
+`pulldown-cmark`, `csv`, `rusqlite`, `zip` and `tar` are named in the brief.
+Nothing else was added.

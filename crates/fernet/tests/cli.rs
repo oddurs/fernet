@@ -323,3 +323,57 @@ fn watch_captures_outside_changes() {
         .stdout("api:2.3.9\n");
     fernet(p).arg("verify").assert().success();
 }
+
+#[test]
+fn completions_and_size_warning() {
+    let tmp = history_fixture();
+    let p = tmp.path();
+    for shell in ["bash", "zsh", "fish"] {
+        let out = fernet(p)
+            .args(["completions", shell])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        assert!(
+            String::from_utf8(out).unwrap().contains("fernet complete"),
+            "{shell}"
+        );
+    }
+    fernet(p).args(["completions", "tcsh"]).assert().code(2);
+    fernet(p)
+        .args(["complete", "--", "infra.yaml#/services/"])
+        .assert()
+        .success()
+        .stdout("infra.yaml#/services/api/\n");
+    fernet(p)
+        .args(["complete", "--", "infra.yaml#/services/api/im"])
+        .assert()
+        .success()
+        .stdout("infra.yaml#/services/api/image\n");
+    let out = fernet(p)
+        .args(["complete", "--", "notes.md@fi"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(String::from_utf8(out).unwrap(), "notes.md@first\n");
+    fernet(p)
+        .args(["complete", "--", "inf"])
+        .assert()
+        .success()
+        .stdout("infra.yaml\n");
+    // A tiny warning limit triggers the warning on `fernet log`.
+    let config = p.join(".fernet/config.toml");
+    let text = fs::read_to_string(&config)
+        .unwrap()
+        .replace("store_warn_bytes = 1073741824", "store_warn_bytes = 10");
+    fs::write(&config, text).unwrap();
+    fernet(p)
+        .arg("log")
+        .assert()
+        .success()
+        .stderr(predicate_contains("warning size"));
+}

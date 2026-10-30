@@ -42,7 +42,11 @@ const TTL_PAST: Duration = Duration::from_secs(60);
 
 /// "No such attribute": `ENODATA` on Linux, `ENOATTR` (93) on macOS.
 fn no_xattr() -> Errno {
-    if cfg!(target_os = "linux") { Errno::from_i32(61) } else { Errno::from_i32(93) }
+    if cfg!(target_os = "linux") {
+        Errno::from_i32(61)
+    } else {
+        Errno::from_i32(93)
+    }
 }
 
 #[cfg(target_os = "linux")]

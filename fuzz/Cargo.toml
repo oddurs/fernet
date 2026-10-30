@@ -56,3 +56,38 @@ path = "fuzz_targets/segment_scan.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "markdown_parse"
+path = "fuzz_targets/markdown_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "csv_parse"
+path = "fuzz_targets/csv_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sqlite_parse"
+path = "fuzz_targets/sqlite_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "zip_parse"
+path = "fuzz_targets/zip_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tar_parse"
+path = "fuzz_targets/tar_parse.rs"
+test = false
+doc = false
+bench = false

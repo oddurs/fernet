@@ -1,5 +1,6 @@
 //! The `fernet` command-line interface.
 
+mod complete;
 mod style;
 
 use std::ffi::{OsStr, OsString};
@@ -102,6 +103,18 @@ enum Command {
         /// Refuse all writes.
         #[arg(long)]
         read_only: bool,
+    },
+    /// Print shell completions: bash, zsh or fish.
+    Completions {
+        /// The shell.
+        shell: String,
+    },
+    /// Candidates for a partly typed path (used by the completion scripts).
+    #[command(hide = true)]
+    Complete {
+        /// The word being completed.
+        #[arg(allow_hyphen_values = true)]
+        word: String,
     },
     /// Capture changes in the foreground until interrupted.
     Watch {
@@ -362,6 +375,7 @@ fn run(cli: &Cli) -> Result<u8, Failure> {
         }
         Command::Log { path, size } => {
             let ctx = Ctx::open(cli, Mode::Read)?;
+            warn_if_large(&ctx.fernet);
             if *size {
                 let u = ctx.need_store()?.usage().map_err(|e| store_failure(&e))?;
                 writeln!(out, "log      {}", style::size(u.log))?;
@@ -388,6 +402,8 @@ fn run(cli: &Cli) -> Result<u8, Failure> {
         Command::Diff { a, b } => diff(cli, a, b, &mut out)?,
         Command::Verify => return verify(cli, &mut out),
         Command::Compact { dry_run } => compact(cli, *dry_run, &mut out)?,
+        Command::Completions { shell } => completions(cli, shell, None, &mut out)?,
+        Command::Complete { word } => completions(cli, "", Some(word), &mut out)?,
         Command::Reindex => {
             let ctx = Ctx::open(cli, Mode::Write)?;
             let n = ctx.need_store()?.reindex().map_err(|e| store_failure(&e))?;
@@ -483,6 +499,7 @@ fn start_watch(cli: &Cli, dir: Option<&Path>) -> Result<u8, Failure> {
     if f.store().is_none() {
         return Err(Failure::new("there is no store here", exit::STORE).hint("fernet init"));
     }
+    warn_if_large(&f);
     watch(&f)?;
     Ok(0)
 }
@@ -551,6 +568,7 @@ fn mount(dir: &Path, mountpoint: &Path, daemon: bool, read_only: bool) -> Result
     )
     .map_err(|e| failure(&e, dir.as_os_str()))?;
     let root = fernet.root().to_owned();
+    warn_if_large(&fernet);
     if mountpoint.starts_with(&root) {
         return Err(Failure::new(
             "the mountpoint can't be inside the backing directory",
@@ -668,6 +686,46 @@ fn compact(cli: &Cli, dry_run: bool, out: &mut impl Write) -> Result<(), Failure
         r.blobs_removed,
         style::size(r.bytes_freed)
     )?;
+    Ok(())
+}
+
+/// Warns on stderr when the store is past its configured size.
+fn warn_if_large(f: &Fernet) {
+    let Some(store) = f.store() else { return };
+    let limit = fernet_fs_store::config_u64(store.dir(), "store_warn_bytes")
+        .unwrap_or(fernet_fs_store::DEFAULT_WARN_BYTES);
+    if let Ok(u) = store.usage()
+        && u.total() > limit
+    {
+        eprintln!(
+            "fernet: the store is {}, past the {} warning size\n  try: fernet compact",
+            style::size(u.total()),
+            style::size(limit)
+        );
+    }
+}
+
+/// `fernet completions <shell>`, or with `word`, the hidden `fernet complete`.
+fn completions(
+    cli: &Cli,
+    shell: &str,
+    word: Option<&str>,
+    out: &mut impl Write,
+) -> Result<(), Failure> {
+    if let Some(word) = word {
+        // Completion must never fail loudly.
+        if let Ok(ctx) = Ctx::open(cli, Mode::Read) {
+            for c in complete::candidates(&ctx.fernet, &ctx.cwd, word) {
+                writeln!(out, "{c}")?;
+            }
+        }
+        return Ok(());
+    }
+    let text = complete::script(shell).ok_or_else(|| {
+        Failure::new(format!("no completions for {shell}"), exit::USAGE)
+            .hint("fernet completions bash|zsh|fish")
+    })?;
+    out.write_all(text.as_bytes())?;
     Ok(())
 }
 

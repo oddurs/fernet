@@ -210,6 +210,9 @@ pub struct Store {
     dirty: bool,
 }
 
+/// Default size past which fernet warns about the store: 1 GiB.
+pub const DEFAULT_WARN_BYTES: u64 = 1 << 30;
+
 /// Store usage, for `fernet log --size`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Usage {
@@ -221,6 +224,14 @@ pub struct Usage {
     pub blobs: u64,
     /// Bytes in the index.
     pub index: u64,
+}
+
+impl Usage {
+    /// Everything together.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.log + self.objects + self.index
+    }
 }
 
 impl Store {
@@ -787,6 +798,8 @@ ice_days = 365
 [limits]
 # Files larger than this aren't captured.
 max_file_size = 52428800
+# Warn when the store grows past this many bytes (log, watch, mount).
+store_warn_bytes = 1073741824
 
 [ignore]
 # Extra gitignore-style patterns, on top of .fernetignore and the defaults

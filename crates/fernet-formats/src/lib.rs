@@ -9,7 +9,11 @@
 //! [`Node::text`] plus one trailing `\n`.
 #![forbid(unsafe_code)]
 
+mod archive;
+mod csv;
 mod json;
+mod markdown;
+mod sqlite;
 mod toml;
 mod yaml;
 
@@ -17,7 +21,11 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::Path;
 
+pub use archive::{MAX_UNPACKED, Tar, Zip};
+pub use csv::Csv;
 pub use json::Json;
+pub use markdown::Markdown;
+pub use sqlite::Sqlite;
 pub use toml::Toml;
 pub use yaml::Yaml;
 
@@ -263,6 +271,7 @@ pub fn type_name(ty: ScalarType) -> &'static str {
         ScalarType::Null => "null",
         ScalarType::Datetime => "date-time",
         ScalarType::Text => "text",
+        ScalarType::Bytes => "file",
     }
 }
 
@@ -301,6 +310,8 @@ pub struct Node {
     /// newline): strings unquoted and unescaped, everything else as written in
     /// the source. Empty for objects and arrays.
     pub text: String,
+    /// For [`ScalarType::Bytes`], the content. Empty otherwise.
+    pub raw: Vec<u8>,
 }
 
 /// Node kinds.
@@ -329,8 +340,11 @@ pub enum ScalarType {
     Null,
     /// A date, time or date-time (TOML).
     Datetime,
-    /// Free text (Markdown bodies, later).
+    /// Free text (Markdown section bodies).
     Text,
+    /// Raw bytes (files inside archives), in [`Node::raw`]. Rendered as-is,
+    /// without a trailing newline.
+    Bytes,
 }
 
 impl Tree {
@@ -367,12 +381,16 @@ impl Tree {
     #[must_use]
     pub fn render(&self, id: NodeId) -> Option<Vec<u8>> {
         let node = self.node(id);
-        matches!(node.kind, NodeKind::Scalar(_)).then(|| {
-            let mut out = Vec::with_capacity(node.text.len() + 1);
-            out.extend_from_slice(node.text.as_bytes());
-            out.push(b'\n');
-            out
-        })
+        match node.kind {
+            NodeKind::Scalar(ScalarType::Bytes) => Some(node.raw.clone()),
+            NodeKind::Scalar(_) => {
+                let mut out = Vec::with_capacity(node.text.len() + 1);
+                out.extend_from_slice(node.text.as_bytes());
+                out.push(b'\n');
+                Some(out)
+            }
+            NodeKind::Object | NodeKind::Array => None,
+        }
     }
 }
 
@@ -399,6 +417,7 @@ impl Builder {
             key_span: None,
             children: Vec::new(),
             text,
+            raw: Vec::new(),
         });
         id
     }
@@ -418,6 +437,22 @@ impl Builder {
             index.insert(key.clone(), children.len());
             children.push((key, child));
         }
+    }
+
+    /// The child of `parent` called `key`.
+    pub(crate) fn child_of(&self, parent: NodeId, key: &str) -> Option<NodeId> {
+        let i = *self.keys.get(&parent)?.get(key)?;
+        self.nodes[parent.0].children.get(i).map(|&(_, c)| c)
+    }
+
+    /// How many children `parent` has.
+    pub(crate) fn child_count(&self, parent: NodeId) -> usize {
+        self.nodes[parent.0].children.len()
+    }
+
+    /// Whether `parent` already has a child called `key`.
+    pub(crate) fn has_child(&self, parent: NodeId, key: &str) -> bool {
+        self.keys.get(&parent).is_some_and(|k| k.contains_key(key))
     }
 
     /// Appends `child` to an array.
@@ -447,11 +482,21 @@ pub struct Registry {
 }
 
 impl Default for Registry {
-    /// JSON, TOML and YAML.
+    /// Every driver.
     fn default() -> Self {
-        // Sniff order matters: TOML before JSON, so `[[package]]` is a table header.
+        // Sniff order matters: binary magic first, then TOML before JSON, so
+        // `[[package]]` is a table header.
         Self {
-            drivers: vec![Box::new(Toml), Box::new(Json), Box::new(Yaml)],
+            drivers: vec![
+                Box::new(Sqlite),
+                Box::new(Zip),
+                Box::new(Tar),
+                Box::new(Toml),
+                Box::new(Json),
+                Box::new(Yaml),
+                Box::new(Markdown),
+                Box::new(Csv),
+            ],
         }
     }
 }
@@ -470,11 +515,11 @@ impl Registry {
         {
             return Some(d.as_ref());
         }
-        if head.contains(&0) {
-            return None;
-        }
+        // Text drivers never claim a head with NUL bytes; binary ones sniff magic.
+        let binary = head.contains(&0);
         self.drivers
             .iter()
+            .filter(|d| !binary || matches!(d.name(), "sqlite" | "zip" | "tar"))
             .find(|d| d.sniff(head))
             .map(AsRef::as_ref)
     }

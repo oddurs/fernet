@@ -14,9 +14,10 @@ fernet wraps an existing directory and exposes the same tree through a FUSE moun
 and a CLI. Your files stay plain files in a plain folder; fernet only adds names
 that don't exist there.
 
-> Status: v0.4. History is captured with `fernet init`, `fernet watch` or a
-> mount. Values inside JSON, TOML and YAML files are readable and writable
-> through `#`, from the CLI or the FUSE mount.
+> Status: v0.5. History is captured with `fernet init`, `fernet watch` or a
+> mount. Values inside JSON, TOML, YAML, Markdown and CSV files are readable
+> and writable through `#`; SQLite databases, zip and tar archives are
+> readable.
 
 ```
 $ echo 9090 > 'mnt/config.json#/server/port'      # a byte splice: nothing else moves
@@ -75,10 +76,31 @@ fernet mark <name> | --rm <name>     add or remove a tephra mark
 fernet diff <a> <b>                  unified diff of any two fernet paths
 fernet compact [--dry-run]           apply the retention policy
 fernet verify                        check log, blobs, manifest
+fernet completions <shell>           print shell completions
 fernet reindex                       rebuild the index from the log
 ```
 
 On macOS, see [docs/MACOS.md](docs/MACOS.md) for the mount.
+
+## Formats
+
+| Format | `#` shows | Writes |
+| --- | --- | --- |
+| JSON (with comments) | objects and arrays | values, new keys, removals |
+| TOML | tables and arrays | values, new keys, removals |
+| YAML | mappings and sequences | values (not anchors, aliases or block scalars) |
+| Markdown | headings as directories, each with a `body` file | bodies, new sections, removals |
+| CSV | rows `0`, `1`, … of fields by header | values, new rows, removals |
+| SQLite | tables → rows by primary key → columns | read-only |
+| zip, tar | the archive's tree | read-only |
+
+## Shell completion
+
+```sh
+eval "$(fernet completions bash)"    # or zsh; fish: fernet completions fish > ~/.config/fish/completions/fernet.fish
+```
+
+Keys complete after `#/`, and versions, marks and time words after `@`.
 
 ## zsh and `#`
 
