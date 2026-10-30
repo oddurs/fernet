@@ -40,6 +40,11 @@ const TTL_PRESENT: Duration = Duration::from_secs(1);
 /// History never changes; cache it longer.
 const TTL_PAST: Duration = Duration::from_secs(60);
 
+/// "No such attribute": `ENODATA` on Linux, `ENOATTR` (93) on macOS.
+fn no_xattr() -> Errno {
+    if cfg!(target_os = "linux") { Errno::from_i32(61) } else { Errno::from_i32(93) }
+}
+
 #[cfg(target_os = "linux")]
 const O_TRUNC: i32 = 0o1000;
 #[cfg(not(target_os = "linux"))]
@@ -1244,7 +1249,7 @@ impl Filesystem for FernetFs {
         _size: u32,
         reply: ReplyXattr,
     ) {
-        reply.error(Errno::ENODATA);
+        reply.error(no_xattr());
     }
 
     fn listxattr(&self, _req: &Request, _ino: INodeNo, size: u32, reply: ReplyXattr) {
