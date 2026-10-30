@@ -11,3 +11,8 @@ publish = false
 workspace = true
 
 [dev-dependencies]
+fernet-fs-core.workspace = true
+fernet-fs-formats.workspace = true
+fernet-fs-path.workspace = true
+proptest = "1"
+tempfile = "3"

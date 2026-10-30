@@ -17,5 +17,13 @@ name = "fernet"
 path = "src/main.rs"
 
 [dependencies]
+fernet-fs-core.workspace = true
+fernet-fs-path.workspace = true
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+tempfile = "3"
