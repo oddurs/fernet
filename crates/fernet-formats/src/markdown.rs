@@ -48,9 +48,13 @@ fn headings(s: &str) -> Vec<Heading> {
                             .find('\n')
                             .map_or(s.len(), |i| range.end + i + 1)
                     };
+                    // Start at the line's start: a heading inside a list item
+                    // or blockquote keeps its `- ` or `> ` with it, not with
+                    // the body before it.
+                    let start = s[..range.start].rfind('\n').map_or(0, |i| i + 1);
                     out.push(Heading {
                         level,
-                        range: range.start..end,
+                        range: start..end,
                         text: text.trim().to_owned(),
                     });
                 }
@@ -156,48 +160,29 @@ impl Driver for Markdown {
                 let span = node.value_span.clone();
                 // Keep the line ending before whatever follows (a heading).
                 let newline = s[span.clone()].ends_with('\n') || span.end < s.len();
-                let literal = if newline {
-                    format!("{text}\n")
+                // A heading at the very end with no newline: the body starts
+                // on the next line.
+                let lead = if span.is_empty()
+                    && span.start == s.len()
+                    && !s.is_empty()
+                    && !s.ends_with('\n')
+                {
+                    "\n"
                 } else {
-                    text.to_owned()
+                    ""
+                };
+                let literal = if newline {
+                    format!("{lead}{text}\n")
+                } else {
+                    format!("{lead}{text}")
                 };
                 let out = crate::replace(src, span, &literal);
                 crate::check_scalar(self, &out, ptr, ScalarType::Text, text)?;
+                same_elsewhere(&leaves(&tree), &leaves(&self.parse(&out)?), ptr)?;
                 return Ok(out);
             }
             Edit::Insert { key, value } => {
-                if node.kind != NodeKind::Object {
-                    return Err(DriverError::WrongKind("not a section"));
-                }
-                if tree.child(id, &key).is_some() {
-                    return Err(DriverError::Exists);
-                }
-                if key.contains('\n') || key.trim().is_empty() {
-                    return Err(DriverError::InvalidValue(
-                        "a heading is one non-empty line".into(),
-                    ));
-                }
-                let level = (ptr.len() + 1).min(6);
-                let body = match &value {
-                    NewValue::EmptyObject => String::new(),
-                    NewValue::Text(t) => format!("\n{}\n", crate::strip_newline(t)),
-                    NewValue::EmptyArray => {
-                        return Err(DriverError::InvalidValue(
-                            "markdown has no lists of sections".into(),
-                        ));
-                    }
-                };
-                let at = node.span.end;
-                let lead = if at == 0 || s[..at].ends_with("\n\n") {
-                    ""
-                } else if s[..at].ends_with('\n') {
-                    "\n"
-                } else {
-                    "\n\n"
-                };
-                let trail = if at < s.len() { "\n" } else { "" };
-                let heading = format!("{lead}{} {}\n{body}{trail}", "#".repeat(level), key.trim());
-                crate::replace(src, at..at, &heading)
+                return self.insert(src, s, &tree, ptr, id, &key, &value);
             }
             Edit::Remove => {
                 let Some((last, _)) = ptr.split_last() else {
@@ -213,7 +198,9 @@ impl Driver for Markdown {
                     };
                     crate::replace(src, span, keep)
                 } else {
-                    crate::replace(src, node.span.clone(), "")
+                    let out = crate::replace(src, node.span.clone(), "");
+                    same_elsewhere(&leaves(&tree), &leaves(&self.parse(&out)?), ptr)?;
+                    return Ok(out);
                 }
             }
         };
@@ -223,6 +210,132 @@ impl Driver for Markdown {
 
     fn capabilities(&self) -> Caps {
         Caps::FULL
+    }
+}
+
+impl Markdown {
+    /// Appends a section `key` under the section at `ptr`, one level below
+    /// it, and checks that nothing else moved.
+    #[allow(clippy::too_many_arguments)] // The parsed state splice already has.
+    fn insert(
+        self,
+        src: &[u8],
+        s: &str,
+        tree: &Tree,
+        ptr: &[String],
+        id: NodeId,
+        key: &str,
+        value: &NewValue,
+    ) -> Result<Vec<u8>, DriverError> {
+        let node = tree.node(id);
+        if node.kind != NodeKind::Object {
+            return Err(DriverError::WrongKind("not a section"));
+        }
+        if tree.child(id, key).is_some() {
+            return Err(DriverError::Exists);
+        }
+        if key.contains('\n') || key.trim().is_empty() {
+            return Err(DriverError::InvalidValue(
+                "a heading is one non-empty line".into(),
+            ));
+        }
+        // One level below the parent heading (the root is level 0).
+        let parent_level = if ptr.is_empty() {
+            0
+        } else {
+            headings(s)
+                .iter()
+                .find(|h| h.range.start == node.span.start)
+                .map_or(0, |h| h.level)
+        };
+        if parent_level >= 6 {
+            return Err(DriverError::Unsupported(
+                "markdown headings stop at level 6",
+            ));
+        }
+        let level = parent_level + 1;
+        let body = match value {
+            NewValue::EmptyObject => String::new(),
+            NewValue::Text(t) => format!("\n{}\n", crate::strip_newline(t)),
+            NewValue::EmptyArray => {
+                return Err(DriverError::InvalidValue(
+                    "markdown has no lists of sections".into(),
+                ));
+            }
+        };
+        let at = node.span.end;
+        let lead = if at == 0 || s[..at].ends_with("\n\n") {
+            ""
+        } else if s[..at].ends_with('\n') {
+            "\n"
+        } else {
+            "\n\n"
+        };
+        let trail = if at < s.len() { "\n" } else { "" };
+        let heading = format!("{lead}{} {}\n{body}{trail}", "#".repeat(level), key.trim());
+        let out = crate::replace(src, at..at, &heading);
+        // The new section must be exactly what was asked for, and
+        // nothing else may move (markup in the key, headings in the body).
+        let after = self.parse(&out)?;
+        let mut child = ptr.to_vec();
+        child.push(key.to_owned());
+        let mut body_ptr = child.clone();
+        body_ptr.push(BODY.to_owned());
+        let new_body = after.get(&body_ptr).map(|id| after.node(id).text.clone());
+        // What the body reads back as: its slice minus one newline.
+        let want = body_text(&format!("{body}{trail}"));
+        if new_body.as_deref() != Some(want.as_str()) {
+            return Err(DriverError::InvalidValue(
+                "that heading or body would change the document's structure".into(),
+            ));
+        }
+        same_elsewhere(&leaves(tree), &leaves(&after), &child)?;
+        Ok(out)
+    }
+}
+
+/// Every body, by pointer.
+fn leaves(t: &Tree) -> std::collections::BTreeMap<Vec<String>, String> {
+    fn walk(
+        t: &Tree,
+        id: NodeId,
+        p: &mut Vec<String>,
+        out: &mut std::collections::BTreeMap<Vec<String>, String>,
+    ) {
+        let n = t.node(id);
+        if let NodeKind::Scalar(_) = n.kind {
+            out.insert(p.clone(), n.text.clone());
+        }
+        for (k, c) in &n.children {
+            p.push(k.clone());
+            walk(t, *c, p, out);
+            p.pop();
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(t, t.root, &mut Vec::new(), &mut out);
+    out
+}
+
+/// Checks that every body outside `ptr` (the edited node and anything below
+/// it) is unchanged.
+fn same_elsewhere(
+    before: &std::collections::BTreeMap<Vec<String>, String>,
+    after: &std::collections::BTreeMap<Vec<String>, String>,
+    ptr: &[String],
+) -> Result<(), DriverError> {
+    let outside = |m: &std::collections::BTreeMap<Vec<String>, String>| {
+        m.iter()
+            .filter(|(k, _)| !k.starts_with(ptr))
+            .map(|(k, v)| (k.clone(), v.trim_end_matches('\n').to_owned()))
+            .collect::<Vec<_>>()
+    };
+    if outside(before) == outside(after) {
+        Ok(())
+    } else {
+        Err(DriverError::InvalidValue(
+            "the edit would change other sections of the document".into(),
+        ))
     }
 }
 

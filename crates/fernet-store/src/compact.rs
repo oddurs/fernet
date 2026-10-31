@@ -286,6 +286,10 @@ impl Store {
             id: last,
             len,
         });
+        // The index points into the retired segments: rebuild it now, before
+        // anything is deleted, so a failure below can't leave this handle
+        // indexing records and blobs that no longer exist.
+        self.reindex()?;
 
         // 3. Retire the old segments.
         for id in old {
@@ -308,9 +312,6 @@ impl Store {
             }
         }
 
-        // 5. The index points into retired segments: rebuild it.
-        check()?;
-        self.reindex()?;
         Ok(report)
     }
 }

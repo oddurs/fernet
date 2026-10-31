@@ -533,10 +533,15 @@ impl Store {
         let path_of = |id| self.dir.join("log").join(segment::file_name(id));
         let active = self.active.as_mut().ok_or(Error::ReadOnly)?;
         let path = path_of(active.id);
-        active
-            .file
-            .write_all(&bytes)
-            .map_err(|e| Error::io(&path, e))?;
+        if let Err(e) = active.file.write_all(&bytes) {
+            // Take back any partial bytes (disk full): a later record must
+            // follow the last whole one, or the log reads as corrupt.
+            let _ = active
+                .file
+                .set_len(active.len)
+                .and_then(|()| active.file.sync_data());
+            return Err(Error::io(&path, e));
+        }
         let id = VersionId {
             segment: active.id,
             offset: active.len,
@@ -548,10 +553,12 @@ impl Store {
             ord: self.index.position().ord + 1,
         };
         self.dirty = true;
+        // Index first: the record is in the log either way, and a flush error
+        // must not leave it unindexed.
+        self.index.apply(&[(id, record.clone())], next)?;
         if self.last_sync.elapsed() >= self.group_commit {
             self.flush()?;
         }
-        self.index.apply(&[(id, record.clone())], next)?;
         Ok(id)
     }
 

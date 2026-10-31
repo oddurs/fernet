@@ -482,6 +482,7 @@ dependencies = [
  "fernet-fs-path",
  "fernet-fs-store",
  "fuser",
+ "nix",
  "notify",
  "tracing",
 ]

@@ -387,7 +387,8 @@ impl<'s> Build<'s> {
 /// True if the token just before `at` (on the same line) is an `&anchor` or
 /// `!tag` property.
 fn has_properties(s: &str, at: usize) -> bool {
-    let before = s[..at].trim_end_matches([' ', '\t']);
+    // Properties may sit on the line above (`a: !!binary` then the value).
+    let before = s[..at].trim_end_matches([' ', '\t', '\n', '\r']);
     let token_start = before
         .rfind([' ', '\t', '\n', ':', '-', '[', '{', ','])
         .map_or(0, |i| i + 1);

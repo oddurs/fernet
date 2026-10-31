@@ -598,3 +598,79 @@ proptest! {
         }
     }
 }
+
+/// Regressions from review.
+#[test]
+fn review_regressions() {
+    use fernet_fs_formats::{Csv, Markdown};
+    let s = |b: Vec<u8>| String::from_utf8(b).unwrap();
+    // JSON: indentation is whitespace only, not the members before.
+    assert_eq!(
+        ins(&Json, "[\n  1, 2\n]", "", "2", text("3")).unwrap(),
+        "[\n  1, 2,\n  3\n]"
+    );
+    assert_eq!(
+        ins(&Json, "{\n  \"a\": [1, 2], \"b\": 3\n}", "", "d", text("4")).unwrap(),
+        "{\n  \"a\": [1, 2], \"b\": 3,\n  \"d\": 4\n}"
+    );
+    // JSON: removing a duplicated key is refused, not half-done.
+    assert!(rm(&Json, "{\"a\": 1, \"b\": 2, \"a\": 3}", "a").is_err());
+    // TOML: CRLF stays CRLF; a reordering print is refused.
+    assert_eq!(
+        ins(&Toml, "a = 1\r\nb = 2\r\n", "", "c", text("3")).unwrap(),
+        "a = 1\r\nb = 2\r\nc = 3\r\n"
+    );
+    assert!(ins(&Toml, "a.b = 1\nc = 2\na.d = 3\n", "", "e", text("4")).is_err());
+    // YAML: a tag on the line above still makes the value read-only.
+    assert!(set(&Yaml, "a: !!binary\n  aGVsbG8=\n", "a", "x").is_err());
+    // CSV: a new row in a one-column file is a row.
+    let out = s(Csv
+        .splice(
+            b"a\n1\n",
+            &ptr(""),
+            Edit::Insert {
+                key: "1".into(),
+                value: NewValue::EmptyObject,
+            },
+        )
+        .unwrap());
+    assert_eq!(
+        Csv.parse(out.as_bytes())
+            .unwrap()
+            .node(Csv.parse(out.as_bytes()).unwrap().root)
+            .children
+            .len(),
+        2
+    );
+    // Markdown: headings in list items keep their marker; read-back is idempotent.
+    let md = "# A\nx\n\n- # B\nmore\n";
+    let t = Markdown.parse(md.as_bytes()).unwrap();
+    let body = &t.node(t.get(&ptr("A/body")).unwrap()).text;
+    assert_eq!(
+        set(&Markdown, md, "A/body", &format!("{body}\n")).unwrap(),
+        md
+    );
+    assert_eq!(
+        set(&Markdown, md, "A/body", "y").unwrap(),
+        "# A\ny\n- # B\nmore\n"
+    );
+    // Markdown: removing a quoted section leaves the next heading alone.
+    assert_eq!(
+        rm(&Markdown, "> # A\n> text\n\n# B\n", "A").unwrap(),
+        "# B\n"
+    );
+    // Markdown: mkdir goes one level below the parent heading.
+    assert_eq!(
+        ins(&Markdown, "## A\ntext\n", "A", "B", NewValue::EmptyObject).unwrap(),
+        "## A\ntext\n\n### B\n"
+    );
+    assert!(ins(&Markdown, "###### A\n", "A", "B", NewValue::EmptyObject).is_err());
+    // Markdown: keys or bodies that would make other sections are refused.
+    assert!(ins(&Markdown, "# A\n", "A", "foo *bar*", NewValue::EmptyObject).is_err());
+    assert!(ins(&Markdown, "# A\n", "A", "X", text("a\n# Y")).is_err());
+    // Markdown: a body after a final heading with no newline.
+    assert_eq!(
+        set(&Markdown, "# A", "A/body", "hello").unwrap(),
+        "# A\nhello"
+    );
+}

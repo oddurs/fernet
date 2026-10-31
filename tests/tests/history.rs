@@ -354,3 +354,45 @@ fn core_sample_collapses_equal_values() {
         ]
     );
 }
+
+/// Regressions from review: moved directories, files replaced by
+/// directories, writes through symlinks.
+#[test]
+fn moves_replacements_and_symlinks() {
+    let w = World::new();
+    w.save("2026-10-01T12:00:00Z", "top/sub/a.txt", "a");
+    w.save("2026-10-01T12:00:00Z", "top/notes", "n");
+    // A directory moves: the old path's files end.
+    w.at("2026-10-02T12:00:00Z");
+    fs::rename(w.root.join("top/sub"), w.root.join("top/sub2")).unwrap();
+    w.f.snapshot(&w.root.join("top/sub")).unwrap();
+    w.f.snapshot_tree(&w.root.join("top/sub2")).unwrap();
+    // A file is replaced by a directory.
+    fs::remove_file(w.root.join("top/notes")).unwrap();
+    fs::create_dir(w.root.join("top/notes")).unwrap();
+    fs::write(w.root.join("top/notes/x"), "x").unwrap();
+    w.f.snapshot_tree(&w.root.join("top")).unwrap();
+    w.at("2026-10-03T12:00:00Z");
+    assert_eq!(w.ls("top@now"), ["notes", "sub2"]);
+    assert_eq!(w.read("top@now/notes/x").unwrap(), "x");
+    assert_eq!(w.read("top@2026-10-01T23:00Z/sub/a.txt").unwrap(), "a");
+
+    // A # write through a symlink edits the target and keeps the link.
+    fs::create_dir(w.root.join("real")).unwrap();
+    fs::write(w.root.join("real/c.json"), "{\"a\": 1}\n").unwrap();
+    std::os::unix::fs::symlink("real/c.json", w.root.join("link.json")).unwrap();
+    let r =
+        w.f.resolve(&FernetPath::parse("link.json#/a").unwrap())
+            .unwrap();
+    w.f.write_value(&r, "2").unwrap();
+    assert!(
+        fs::symlink_metadata(w.root.join("link.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::read_to_string(w.root.join("real/c.json")).unwrap(),
+        "{\"a\": 2}\n"
+    );
+}

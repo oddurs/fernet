@@ -94,7 +94,10 @@ fn cat_through_the_mount_is_within_10_percent() {
     let _ = Command::new("fusermount3").arg("-u").arg(&mnt).status();
     let ratio = mounted.as_secs_f64() / direct.as_secs_f64();
     println!("cat 64 MiB, warm: backing {direct:?}, mount {mounted:?}, ratio {ratio:.2}");
-    if !cfg!(debug_assertions) {
+    // CI runners lack FUSE passthrough (DECISIONS 49): there the number is
+    // reported, not asserted.
+    let report_only = std::env::var_os("FERNET_BENCH_REPORT_ONLY").is_some();
+    if !cfg!(debug_assertions) && !report_only {
         assert!(ratio <= 1.10, "ratio {ratio:.2}");
     }
 }

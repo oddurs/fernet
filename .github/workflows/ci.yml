@@ -50,9 +50,11 @@ jobs:
 
   bench:
     runs-on: ubuntu-latest
-    # Shared runners are noisy and older kernels lack FUSE passthrough; the
-    # numbers are reported, not gated (see docs/reports/M6.md).
-    continue-on-error: true
+    # Shared runners are noisy and their kernels lack FUSE passthrough: the
+    # mount ratio is reported, not asserted (DECISIONS 49). The `#` read
+    # bound is still asserted.
+    env:
+      FERNET_BENCH_REPORT_ONLY: "1"
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y fuse3

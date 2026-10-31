@@ -79,9 +79,11 @@ pub fn scan(bytes: &[u8], id: u64) -> Scan {
                 let at_tail = match bad {
                     Bad::Truncated => true,
                     // A checksum failure on a record that ends exactly at EOF
-                    // can be a torn write whose length field landed.
-                    Bad::Crc | Bad::Field => declared_end(&bytes[at..]) == Some(bytes.len() - at),
-                    Bad::Magic | Bad::Length => false,
+                    // can be a torn write whose length field landed. A record
+                    // whose checksum matches wasn't torn: a bad field is
+                    // corruption (FORMAT.md section 6).
+                    Bad::Crc => declared_end(&bytes[at..]) == Some(bytes.len() - at),
+                    Bad::Field | Bad::Magic | Bad::Length => false,
                 };
                 return Scan {
                     records,

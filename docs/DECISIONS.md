@@ -609,3 +609,84 @@ or before the instant (a reverse range scan in both backends) instead of loading
 every version. Directory listings in the past and every `@` lookup get cheaper
 on long histories. The reindex property test compares the two backends'
 answers.
+
+## 55. Real inodes are keyed by path and file identity
+
+**Context.** A review found that real inodes were keyed by path alone. Once a
+path's file was replaced (by fernet's own temp+rename `#` writes, an editor's
+atomic save, or unlink plus recreate) while a handle was open, the new file
+shared the old kernel inode. Under passthrough that meant stale reads and
+writes that went to the unlinked file.
+
+**Decision.** Each real node records its backing file's (device, inode). A
+lookup that finds a different file at the path orphans the old node (it lives
+until the kernel forgets it) and registers a new inode. An open whose fd has a
+different identity than its node returns `ESTALE`, so the kernel looks the path
+up again. Unlink, rmdir and rename-over orphan the old node, and `rename`
+rebases value handles inside moved files. Passthrough backing ids stay keyed by
+inode, which is now per file. `create` uses passthrough too, because the kernel
+refuses to mix cached and passthrough opens on one inode. `fstat` and
+`ftruncate` on an open handle use the handle's file, so they keep working after
+an unlink.
+
+## 56. Hardening the mount's setattr and value buffers
+
+**Decision.** `#` value buffers are capped at 16 MiB (`EFBIG` above it), so a
+huge `truncate` or `pwrite` can't exhaust memory. Timestamps go through
+`utimensat` with `AT_SYMLINK_NOFOLLOW` (via `nix`, already in the tree through
+`fuser`), so `touch -h` on a symlink changes the link, not its target. Path
+truncates open with `O_NONBLOCK`, so a FIFO can't stall a worker thread.
+`chown` to another owner, and `chmod`/`chown` on virtual nodes, return `EPERM`
+instead of succeeding silently. An explicit `ftruncate` on a value applies at
+flush, like a write. Listing a large file's keys no longer adds inodes, and a
+lookup reference is taken only once the kernel has the entry. No lock is held
+across `write`/`fsync` syscalls.
+
+## 57. History and store fixes from review
+
+**Decision.**
+- **Endings are recorded.** A missing path also tombstones every live path
+  under it, so a removed or moved directory doesn't stay "alive" in the past. A
+  path that is no longer a regular file (replaced by a directory, symlink or
+  other) gets a tombstone. A record is never stamped behind the path's latest
+  record: a tree capture's time is taken before its walk, and a concurrent
+  write may be newer.
+- **Writes resolve symlinks.** `#` writes and `fernet write` go to the link's
+  target (canonicalized; refused if it's outside the root), and the per-file
+  lock is keyed on the canonical path. Temp files get unique names
+  (`create_new`, process id and a counter, stem cut to fit `NAME_MAX`).
+- **Append failures roll back.** A partial write is truncated off the active
+  segment, so later records follow the last whole one. The index is updated
+  before a group-commit fsync can fail.
+- **Compaction reindexes at its commit point**, before deleting anything.
+- **A checksum-valid record with a bad field is corruption**, even at the
+  tail; only truncated or crc-failing tails are torn writes (FORMAT.md §6 as
+  written).
+- **Durability and bounds:** creating a new `objects/ab/` directory fsyncs
+  `objects/`, and blob decompression is streamed and bounded by the record's
+  size.
+- **`.fernet` on macOS** is matched case-insensitively, since the default APFS
+  ignores case.
+
+## 58. Format and CLI fixes from review
+
+**Decision.**
+- **JSON**: inserted members copy only the last member's leading whitespace.
+  It used to copy the whole line before it, which duplicated earlier members
+  on shared lines. Removing a duplicated key is refused, since removing one
+  occurrence would bring back another value.
+- **Markdown**: a section starts at the start of its heading's line, so
+  headings in list items and blockquotes keep their `- `/`> `. Every body
+  write, insert and remove now checks that no other section changed, ignoring
+  trailing newlines (which inserts necessarily add). New sections go one level
+  below their parent's actual level and are refused below level 6. A body after
+  a final heading with no newline starts on its own line.
+- **TOML**: `toml_edit`'s output keeps a CRLF file CRLF. An edit is refused if
+  printing would reorder untouched lines (dotted keys interleaved with others).
+- **YAML**: tags and anchors on the line above a value still make it read-only.
+- **CSV**: a new row in a one-column file is written `""`, so it's a row.
+- **SQLite**: WAL-mode files are read (their header is patched in a copy), and
+  a NULL primary key is named `(null N)` so it can't collide with a real key.
+- **CLI**: `fernet write` reads stdin as bytes (real files may be binary;
+  values must be UTF-8). Bash completion completes the whole word, including
+  `@` and `:`, which are in bash's `COMP_WORDBREAKS`.
