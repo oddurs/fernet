@@ -250,8 +250,36 @@ fn edit_doc(
         slot = step(slot, key).ok_or(DriverError::NotFound)?;
     }
     f(slot)?;
+    let mut printed = doc.to_string();
+    // toml_edit prints LF; keep a CRLF file CRLF.
+    if s.contains("\r\n") {
+        printed = printed.replace("\r\n", "\n").replace('\n', "\r\n");
+    }
+    // toml_edit may regroup dotted keys when it prints. Insertions and
+    // removals are fine; moving untouched lines is not.
+    // Lines both versions share (edited lines drop out) must keep their order.
+    let old_lines: Vec<&str> = s[start..]
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    let new_lines: Vec<&str> = printed.lines().filter(|l| !l.trim().is_empty()).collect();
+    let kept_old: Vec<&str> = old_lines
+        .iter()
+        .copied()
+        .filter(|l| new_lines.contains(l))
+        .collect();
+    let kept_new: Vec<&str> = new_lines
+        .iter()
+        .copied()
+        .filter(|l| old_lines.contains(l))
+        .collect();
+    if kept_old != kept_new {
+        return Err(DriverError::Unsupported(
+            "this edit would reorder the file's keys; edit it by hand",
+        ));
+    }
     let mut out = s.as_bytes()[..start].to_vec();
-    out.extend_from_slice(doc.to_string().as_bytes());
+    out.extend_from_slice(printed.as_bytes());
     Ok(out)
 }
 

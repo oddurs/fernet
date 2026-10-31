@@ -667,3 +667,26 @@ across `write`/`fsync` syscalls.
   size.
 - **`.fernet` on macOS** is matched case-insensitively, since the default APFS
   ignores case.
+
+## 58. Format and CLI fixes from review
+
+**Decision.**
+- **JSON**: inserted members copy only the last member's leading whitespace.
+  It used to copy the whole line before it, which duplicated earlier members
+  on shared lines. Removing a duplicated key is refused, since removing one
+  occurrence would bring back another value.
+- **Markdown**: a section starts at the start of its heading's line, so
+  headings in list items and blockquotes keep their `- `/`> `. Every body
+  write, insert and remove now checks that no other section changed, ignoring
+  trailing newlines (which inserts necessarily add). New sections go one level
+  below their parent's actual level and are refused below level 6. A body after
+  a final heading with no newline starts on its own line.
+- **TOML**: `toml_edit`'s output keeps a CRLF file CRLF. An edit is refused if
+  printing would reorder untouched lines (dotted keys interleaved with others).
+- **YAML**: tags and anchors on the line above a value still make it read-only.
+- **CSV**: a new row in a one-column file is written `""`, so it's a row.
+- **SQLite**: WAL-mode files are read (their header is patched in a copy), and
+  a NULL primary key is named `(null N)` so it can't collide with a real key.
+- **CLI**: `fernet write` reads stdin as bytes (real files may be binary;
+  values must be UTF-8). Bash completion completes the whole word, including
+  `@` and `:`, which are in bash's `COMP_WORDBREAKS`.
