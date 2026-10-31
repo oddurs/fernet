@@ -1,7 +1,9 @@
 name: ci
 
 on:
+  # Branches build through their pull request; main builds on every push.
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
