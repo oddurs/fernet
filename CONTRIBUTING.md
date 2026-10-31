@@ -12,8 +12,10 @@
    and a fuzz smoke run per target.
 5. Squash-merge, then delete the branch.
 
-`main` is always releasable. Releases are tags (`v1.2.3`); the release
-workflow builds and publishes the binaries.
+`main` is always releasable. To release, open a PR that bumps the workspace
+version and adds a `CHANGELOG.md` section; after it merges, tag the merge
+commit (`v1.2.3`) and push the tag. The release workflow builds and publishes
+the binaries.
 
 ## Rules that don't bend
 

@@ -35,6 +35,19 @@ db
 cache
 ```
 
+## Install
+
+Prebuilt binaries for Linux (x86_64, aarch64) and macOS (Apple silicon) are on
+the [releases page](https://github.com/oddurs/fernet/releases), with shell
+completions in each archive. Or build from source with Rust 1.90 or later:
+
+```
+cargo install --locked --git https://github.com/oddurs/fernet fernet-fs
+```
+
+The mount needs FUSE: `fuse3` on Linux, [macFUSE](docs/MACOS.md) on macOS.
+Changes are listed in [CHANGELOG.md](CHANGELOG.md).
+
 ## The grammar
 
 A fernet path is a normal relative path where components may carry lenses:
