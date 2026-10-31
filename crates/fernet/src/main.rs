@@ -356,13 +356,14 @@ fn run(cli: &Cli) -> Result<u8, Failure> {
                 Err(f) if f.code == exit::STORE => Ctx::open(cli, Mode::Read)?,
                 other => other?,
             };
+            // Bytes: a real file may be binary; values must be UTF-8.
             let value = match value.as_deref() {
                 None | Some("-") => {
-                    let mut buf = String::new();
-                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                    let mut buf = Vec::new();
+                    std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)?;
                     buf
                 }
-                Some(v) => v.to_owned(),
+                Some(v) => v.as_bytes().to_vec(),
             };
             write(&ctx, path, &value)?;
         }
@@ -617,7 +618,11 @@ fn mount(dir: &Path, mountpoint: &Path, daemon: bool, read_only: bool) -> Result
 }
 
 /// `fernet write`: a value, a new key in an object or array, or a real file.
-fn write(ctx: &Ctx, arg: &OsStr, value: &str) -> Result<(), Failure> {
+fn write(ctx: &Ctx, arg: &OsStr, bytes: &[u8]) -> Result<(), Failure> {
+    let text = || {
+        std::str::from_utf8(bytes)
+            .map_err(|_| Failure::new("a value must be utf-8 text", exit::INVALID))
+    };
     let f = &ctx.fernet;
     let mut names = f.user_names(&ctx.cwd, arg).map_err(|e| failure(&e, arg))?;
     let Some(last) = names.pop() else {
@@ -634,20 +639,20 @@ fn write(ctx: &Ctx, arg: &OsStr, value: &str) -> Result<(), Failure> {
                 ..
             },
             _,
-        ) => f.write_value(&target, value),
-        (Resolved::RealFile { .. }, _) => f.write_file(&target, value.as_bytes()),
+        ) => f.write_value(&target, text()?),
+        (Resolved::RealFile { .. }, _) => f.write_file(&target, bytes),
         (Resolved::Missing, Resolved::Inside { .. }) => {
             let key = fernet_fs_path::decode_token(&last.to_string_lossy())
                 .ok_or_else(|| Failure::new("invalid ~ escape in the key", exit::USAGE))?;
             f.insert(
                 &parent,
                 &key,
-                fernet_fs_core::NewValue::Text(value.to_owned()),
+                fernet_fs_core::NewValue::Text(text()?.to_owned()),
             )
         }
         (Resolved::Missing, Resolved::RealDir { path }) => {
             let path = path.join(&last);
-            std::fs::write(&path, value).map_err(|e| {
+            std::fs::write(&path, bytes).map_err(|e| {
                 Failure::new(
                     format!("{}: {e}", path.display()).to_lowercase(),
                     exit::INTERNAL,

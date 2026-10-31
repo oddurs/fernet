@@ -103,8 +103,20 @@ impl Driver for Json {
             }
             Edit::Remove => {
                 let out = remove(src, &tree, ptr)?;
-                self.parse(&out)
+                let after = self
+                    .parse(&out)
                     .map_err(|_| DriverError::Unsupported("the edit would produce invalid json"))?;
+                // A duplicated key: removing one occurrence would bring back
+                // another value. Refuse rather than report a removal that
+                // didn't happen.
+                let in_object = tree
+                    .get(&ptr[..ptr.len().saturating_sub(1)])
+                    .is_some_and(|p| tree.node(p).kind == NodeKind::Object);
+                if in_object && after.get(ptr).is_some() {
+                    return Err(DriverError::Unsupported(
+                        "the key appears more than once; remove the duplicates by hand",
+                    ));
+                }
                 Ok(out)
             }
         }
@@ -225,8 +237,10 @@ fn insert(
         .unwrap_or(last);
     let multiline = s[open..first.span.start].contains('\n');
     let indent = if multiline {
+        // Only the leading whitespace: the line may hold earlier members.
         let line_start = s[..last.span.start].rfind('\n').map_or(0, |i| i + 1);
-        s[line_start..last.span.start].to_owned()
+        let line = &s[line_start..last.span.start];
+        line[..line.len() - line.trim_start().len()].to_owned()
     } else {
         String::new()
     };

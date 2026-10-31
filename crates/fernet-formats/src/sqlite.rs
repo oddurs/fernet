@@ -55,6 +55,17 @@ impl Driver for Sqlite {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_MEMORY;
         let mut conn = Connection::open_in_memory_with_flags(flags).map_err(|e| err(&e))?;
+        // WAL-mode files (header bytes 18-19 = 2) can't open from memory:
+        // read them as rollback-journal databases (the bytes are a copy).
+        let mut copy;
+        let src = if src.get(18..20) == Some(&[2, 2]) {
+            copy = src.to_vec();
+            copy[18] = 1;
+            copy[19] = 1;
+            &copy[..]
+        } else {
+            src
+        };
         conn.deserialize_read_exact(MAIN_DB, src, src.len(), true)
             .map_err(|e| err(&e))?;
         // Don't run anything a hostile schema asks for.
@@ -110,25 +121,28 @@ fn add_rows(
             .collect::<Result<_, _>>()
             .map_err(|e| err(&e))?
     };
-    let (sql, key_col) = match pk.as_slice() {
-        [one] => (format!("SELECT {}, * FROM {q}", quote_ident(one)), true),
-        _ => (format!("SELECT rowid, * FROM {q}"), true),
+    let sql = match pk.as_slice() {
+        [one] => format!("SELECT {}, * FROM {q}", quote_ident(one)),
+        _ => format!("SELECT rowid, * FROM {q}"),
     };
-    let mut st = match conn.prepare(&sql) {
-        Ok(st) => st,
-        // WITHOUT ROWID with a composite key.
-        Err(_) => conn
-            .prepare(&format!("SELECT NULL, * FROM {q}"))
-            .map_err(|e| err(&e))?,
+    let (mut st, keyed) = match conn.prepare(&sql) {
+        Ok(st) => (st, true),
+        // WITHOUT ROWID with a composite key: rows by position.
+        Err(_) => (
+            conn.prepare(&format!("SELECT NULL, * FROM {q}"))
+                .map_err(|e| err(&e))?,
+            false,
+        ),
     };
     let columns: Vec<String> = st.column_names().skip(1).map(str::to_owned).collect();
     let mut rows = st.query([]).map_err(|e| err(&e))?;
     let mut index = 0usize;
     while let Some(row) = rows.next().map_err(|e| err(&e))? {
         let key = match row.get_ref(0).map_err(|e| err(&e))? {
-            ValueRef::Null => index.to_string(),
-            v if key_col => scalar(v).1,
-            _ => index.to_string(),
+            _ if !keyed => index.to_string(),
+            // A NULL primary key: a name no real key collides with.
+            ValueRef::Null => format!("(null {index})"),
+            v => scalar(v).1,
         };
         index += 1;
         let r = b.push(NodeKind::Object, 0..0, String::new());
@@ -210,6 +224,16 @@ mod tests {
         assert_eq!(keys(t.get(&["logs".into()]).unwrap()), ["1", "2"]);
         assert_eq!(get(&["pairs", "0", "b"]).text, "y");
         assert!(Sqlite.parse(b"not a database").is_err());
+        // NULL keys don't collide with real ones; WAL-mode files open.
+        let bytes = db(
+            "CREATE TABLE t (k TEXT PRIMARY KEY, v); INSERT INTO t VALUES (NULL, 'a'), ('0', 'b');",
+        );
+        let t2 = Sqlite.parse(&bytes).unwrap();
+        assert_eq!(t2.node(t2.get(&["t".into()]).unwrap()).children.len(), 2);
+        let mut wal = db("CREATE TABLE w (x); INSERT INTO w VALUES (1);");
+        wal[18] = 2;
+        wal[19] = 2;
+        assert!(Sqlite.parse(&wal).is_ok());
         let mut broken = bytes.clone();
         broken.truncate(200);
         assert!(Sqlite.parse(&broken).is_err() || Sqlite.parse(&broken).is_ok());

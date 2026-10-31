@@ -143,9 +143,10 @@ checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
 name = "fernet-fs-formats"
-version = "0.0.0"
+version = "1.0.0"
 dependencies = [
  "csv",
+ "flate2",
  "pulldown-cmark",
  "rusqlite",
  "saphyr-parser",
@@ -157,11 +158,11 @@ dependencies = [
 
 [[package]]
 name = "fernet-fs-path"
-version = "0.0.0"
+version = "1.0.0"
 
 [[package]]
 name = "fernet-fs-store"
-version = "0.0.0"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "crc32c",

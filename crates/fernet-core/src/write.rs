@@ -93,10 +93,26 @@ impl Fernet {
                 });
             }
         };
+        let path = self.write_target(&path)?;
         let lock = self.locks.get(&path);
         let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
         replace_file(&path, bytes)?;
         self.capture(&path)
+    }
+
+    /// Where a write to `path` lands: symlinks resolved (replacing the link
+    /// itself would leave the real file unchanged), and inside the root.
+    /// The canonical path is also what the per-file lock is keyed on.
+    fn write_target(&self, path: &Path) -> Result<PathBuf> {
+        let real = fs::canonicalize(path).map_err(|e| Error::io(path, e))?;
+        if real.starts_with(self.root()) {
+            Ok(real)
+        } else {
+            Err(Error::Unsupported {
+                path: self.display(path),
+                message: "it links outside the root; edit the target directly".into(),
+            })
+        }
     }
 
     /// What the driver for the file behind `r` can do, if it has one.
@@ -147,6 +163,7 @@ impl Fernet {
     /// it, fsync, check the file didn't change meanwhile, rename over it,
     /// then snapshot. A change during the edit is retried once.
     fn edit(&self, path: &Path, pointer: &[String], edit: &Edit) -> Result<()> {
+        let path = &self.write_target(path)?;
         let lock = self.locks.get(path);
         let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
         let shown = self.display(path);
@@ -216,17 +233,30 @@ fn driver_error(e: DriverError, path: &str, pointer: &[String]) -> Error {
     }
 }
 
+/// A fresh temp name beside `path`: unique per process and call, short
+/// enough for `NAME_MAX` (the stem is cut to fit).
 fn temp_beside(path: &Path) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    path.with_file_name(format!(".{name}.fernet-{}.tmp", std::process::id()))
+    let mut stem: String = name.chars().take(160).collect();
+    while stem.len() > 160 {
+        stem.pop();
+    }
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    path.with_file_name(format!(".{stem}.fernet-{}-{n}.tmp", std::process::id()))
 }
 
-/// Writes `bytes` to `tmp` with `like`'s permissions, fsynced.
+/// Writes `bytes` to a new file `tmp` with `like`'s permissions, fsynced.
+/// `create_new`: never truncates a file someone else is writing.
 fn write_temp(tmp: &Path, like: &Path, bytes: &[u8]) -> Result<()> {
-    let mut f = File::create(tmp).map_err(|e| Error::io(tmp, e))?;
+    let mut f = File::options()
+        .write(true)
+        .create_new(true)
+        .open(tmp)
+        .map_err(|e| Error::io(tmp, e))?;
     f.write_all(bytes).map_err(|e| Error::io(tmp, e))?;
     if let Ok(meta) = fs::metadata(like) {
         f.set_permissions(meta.permissions())

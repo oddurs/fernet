@@ -377,3 +377,20 @@ fn completions_and_size_warning() {
         .success()
         .stderr(predicate_contains("warning size"));
 }
+
+#[test]
+fn write_takes_binary_stdin_for_files() {
+    let tmp = fixture();
+    let p = tmp.path();
+    fernet(p)
+        .args(["write", "b.bin"])
+        .write_stdin(vec![0xff, 0xfe, 0x00])
+        .assert()
+        .success();
+    assert_eq!(fs::read(p.join("b.bin")).unwrap(), [0xff, 0xfe, 0x00]);
+    fernet(p)
+        .args(["write", "config.json#/server/name"])
+        .write_stdin(vec![0xff])
+        .assert()
+        .code(3);
+}

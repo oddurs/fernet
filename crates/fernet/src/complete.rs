@@ -17,13 +17,19 @@ pub(crate) fn script(shell: &str) -> Option<String> {
         "bash" => format!(
             r#"# fernet completion for bash. Add to ~/.bashrc:  eval "$(fernet completions bash)"
 _fernet() {{
-    local cur="${{COMP_WORDS[COMP_CWORD]}}"
+    # The whole word, not split at `@` or `:` (both in COMP_WORDBREAKS).
+    local line="${{COMP_LINE:0:COMP_POINT}}"
+    local cur="${{line##*[[:space:]]}}"
     if [ "$COMP_CWORD" -eq 1 ]; then
         COMPREPLY=($(compgen -W "{COMMANDS}" -- "$cur"))
         return
     fi
     local IFS=$'\n'
-    COMPREPLY=($(fernet complete -- "$cur" 2>/dev/null))
+    local candidates=($(fernet complete -- "$cur" 2>/dev/null))
+    # bash replaces only the text after the last word break: drop that prefix.
+    local breaks="${{COMP_WORDBREAKS// /}}"
+    local prefix="${{cur%"${{cur##*[$breaks]}}"}}"
+    COMPREPLY=("${{candidates[@]#"$prefix"}}")
     compopt -o nospace 2>/dev/null
 }}
 complete -F _fernet fernet

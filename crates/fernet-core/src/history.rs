@@ -129,6 +129,39 @@ pub struct Stratum {
     pub value: Option<Vec<u8>>,
 }
 
+fn tombstone(rel: &str, time: i64) -> Record {
+    Record {
+        kind: Kind::Delete,
+        time,
+        path: rel.to_owned(),
+        hash: Hash::ZERO,
+        size: 0,
+        extra: String::new(),
+    }
+}
+
+/// Tombstones every live path under `rel/` whose file is gone from disk.
+/// Returns the first record written.
+fn tombstone_under(
+    store: &mut Store,
+    root: &Path,
+    rel: &str,
+    time: i64,
+) -> Result<Option<VersionId>> {
+    let mut first = None;
+    for p in store.paths(&format!("{rel}/"))? {
+        let Some(v) = store.version_at(&p, i64::MAX)?.filter(|v| v.hash.is_some()) else {
+            continue;
+        };
+        if fs::symlink_metadata(root.join(&p)).is_ok_and(|m| m.is_file()) {
+            continue;
+        }
+        let id = store.append(&tombstone(&p, time.max(v.time)))?;
+        first.get_or_insert(id);
+    }
+    Ok(first)
+}
+
 /// What exists at `rel` at instant `t`: a file, a directory (some path below
 /// it existed), or nothing.
 pub(crate) fn entry_at(store: &Store, path: &Path, rel: &str, t: i64) -> Result<Resolved> {
@@ -279,26 +312,34 @@ impl Fernet {
         if rel.is_empty() || self.ignore().ignored(&path, false) {
             return Ok(None);
         }
-        let latest = store.versions(&rel)?.pop();
+        let latest = store.version_at(&rel, i64::MAX)?;
+        let live = latest.as_ref().is_some_and(|v| v.hash.is_some());
+        // Never record behind the path's latest record: a tree capture stamps
+        // a time taken before its walk, and a concurrent write may be newer.
+        let time = latest.as_ref().map_or(time, |v| time.max(v.time));
         let meta = match fs::symlink_metadata(&path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if latest.is_some_and(|v| v.hash.is_some()) {
-                    let r = Record {
-                        kind: Kind::Delete,
-                        time,
-                        path: rel,
-                        hash: Hash::ZERO,
-                        size: 0,
-                        extra: String::new(),
-                    };
-                    return Ok(Some(store.append(&r)?));
+                // Gone: the path itself, and anything that lived under it (a
+                // removed or moved directory).
+                let mut first = None;
+                if live {
+                    first = Some(store.append(&tombstone(&rel, time))?);
                 }
-                return Ok(None);
+                let under = tombstone_under(&mut store, self.root(), &rel, time)?;
+                return Ok(first.or(under));
             }
             Err(e) => return Err(Error::io(&path, e)),
         };
-        if !meta.is_file() || meta.len() > self.ignore().max_file() {
+        if !meta.is_file() {
+            // A file replaced by a directory, symlink or other: it ended.
+            return if live {
+                Ok(Some(store.append(&tombstone(&rel, time))?))
+            } else {
+                Ok(None)
+            };
+        }
+        if meta.len() > self.ignore().max_file() {
             return Ok(None);
         }
         let bytes = fs::read(&path).map_err(|e| Error::io(&path, e))?;
@@ -346,7 +387,8 @@ impl Fernet {
             for p in store.paths(&prefix)? {
                 let alive = store.versions(&p)?.last().is_some_and(|v| v.hash.is_some());
                 let path = self.root().join(&p);
-                if alive && fs::symlink_metadata(&path).is_err() {
+                // Gone, or no longer a regular file.
+                if alive && !fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
                     gone.push(path);
                 }
             }

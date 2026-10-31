@@ -218,7 +218,12 @@ impl Driver for Csv {
                 } else {
                     newline
                 };
-                let row = ",".repeat(header.saturating_sub(1));
+                // One column: an empty row would be a blank line, which is no row.
+                let row = if header == 1 {
+                    "\"\"".to_owned()
+                } else {
+                    ",".repeat(header.saturating_sub(1))
+                };
                 crate::replace(src, src.len()..src.len(), &format!("{lead}{row}{newline}"))
             }
             Edit::Remove => {
