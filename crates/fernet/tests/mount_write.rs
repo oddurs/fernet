@@ -12,8 +12,8 @@ use std::time::Duration;
 
 /// Quiet period configured for these tests.
 const WINDOW: Duration = Duration::from_millis(300);
-/// Long enough for a debounced capture to land.
-const SETTLE: Duration = Duration::from_millis(900);
+/// How long a debounced capture may take on a slow machine.
+const DEADLINE: Duration = Duration::from_secs(10);
 
 fn fuse_available() -> bool {
     let ok = Path::new("/dev/fuse").exists()
@@ -44,6 +44,19 @@ impl Mounted {
             .arg("-u")
             .arg(&self.mnt)
             .status();
+    }
+
+    /// Waits until `file` has exactly `n` kept versions, then holds for two
+    /// more debounce windows and checks it didn't go past `n`. Waiting on the
+    /// count, not a fixed sleep, keeps slow machines from failing; holding
+    /// keeps "exactly one version per save" strict.
+    fn settle(&self, file: &str, n: usize) {
+        let start = std::time::Instant::now();
+        while self.versions(file) < n && start.elapsed() < DEADLINE {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(WINDOW * 2);
+        assert_eq!(self.versions(file), n, "{file}");
     }
 
     /// Kept versions of `file`, via the CLI (the mount holds the store).
@@ -264,9 +277,8 @@ fn editor_saves_are_one_version_each() {
     for (name, save) in editors {
         for round in 0..2 {
             save(&m.mnt, "notes.md", &format!("{name} {round}\n"));
-            std::thread::sleep(SETTLE);
             expected += 1;
-            assert_eq!(m.versions("notes.md"), expected, "{name} save {round}");
+            m.settle("notes.md", expected);
             assert_eq!(
                 fs::read_to_string(m.backing.join("notes.md")).unwrap(),
                 format!("{name} {round}\n")
@@ -286,8 +298,7 @@ fn editor_saves_are_one_version_each() {
     // Two quick saves inside one window coalesce.
     vscode_save(&m.mnt, "notes.md", "quick 1\n");
     vscode_save(&m.mnt, "notes.md", "quick 2\n");
-    std::thread::sleep(SETTLE);
-    assert_eq!(m.versions("notes.md"), expected + 1);
+    m.settle("notes.md", expected + 1);
 }
 
 #[test]
@@ -297,13 +308,11 @@ fn outside_changes_are_captured_while_mounted() {
     };
     fs::write(m.backing.join("a.txt"), "two\n").unwrap();
     fs::write(m.backing.join("b.txt"), "new\n").unwrap();
-    std::thread::sleep(SETTLE);
-    assert_eq!(m.versions("a.txt"), 2);
-    assert_eq!(m.versions("b.txt"), 1);
+    m.settle("a.txt", 2);
+    m.settle("b.txt", 1);
     // A write through the mount isn't counted twice by the watcher.
     fs::write(m.mnt.join("a.txt"), "three\n").unwrap();
-    std::thread::sleep(SETTLE);
-    assert_eq!(m.versions("a.txt"), 3);
+    m.settle("a.txt", 3);
 }
 
 /// Every regular file under `dir` (relative path → bytes), skipping `.fernet`.
