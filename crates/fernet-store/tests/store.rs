@@ -497,8 +497,8 @@ fn a_checksummed_bad_record_at_the_tail_is_corruption() {
 fn compaction_failure_after_commit_keeps_the_index_honest() {
     use fernet_fs_store::compact::{CrashAfter, Policy};
     let tmp = tempfile::tempdir().unwrap();
-    let mut s = Store::init(tmp.path()).unwrap();
     const DAY: i64 = 86_400 * 1_000_000_000;
+    let mut s = Store::init(tmp.path()).unwrap();
     for i in 0..20 {
         write(&mut s, "a", format!("v{i}").as_bytes(), i * DAY);
     }
