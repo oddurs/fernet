@@ -354,3 +354,115 @@ fn invariant_1_deleting_the_store_keeps_current_data() {
         Some(&b"{\"a\": 3}\n"[..])
     );
 }
+
+/// Regressions from review: replacing files while handles are open,
+/// recreate-after-unlink, creates read back, huge truncates, FIFOs, symlinks,
+/// renames under open value handles, chown.
+#[test]
+fn replacement_and_edge_cases() {
+    use std::os::unix::fs::MetadataExt;
+    let Some(m) = mount(&[
+        ("d.json", "{\"n\": 1}\n"),
+        ("f.txt", "hello\n"),
+        ("o1", "target\n"),
+    ]) else {
+        return;
+    };
+    let mnt = &m.mnt;
+    let sh = |cmd: &str| {
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(mnt)
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+
+    // A # write replaces the file (temp + rename) while a reader holds it open:
+    // later reads see the new content, and writes land in the new file.
+    let (ok, out) = sh("exec 5<d.json; echo 42 > 'd.json#/n'; cat d.json");
+    assert!(ok);
+    assert_eq!(out, "{\"n\": 42}\n");
+    let (ok, _) = sh("exec 5<d.json; echo 7 > 'd.json#/n'; echo OVERWRITE > d.json");
+    assert!(ok);
+    assert_eq!(
+        fs::read_to_string(m.backing.join("d.json")).unwrap(),
+        "OVERWRITE\n"
+    );
+
+    // Unlink with an open fd, then recreate: the new file is a new file.
+    let (ok, out) = sh("exec 4<f.txt; rm f.txt; echo NEWDATA > f.txt; cat f.txt; cat <&4");
+    assert!(ok, "{out}");
+    assert_eq!(out, "NEWDATA\nhello\n");
+
+    // A file read while its creator still has it open.
+    let (ok, out) = sh("exec 3>new.txt; echo abc >&3; cat new.txt");
+    assert!(ok, "{out}");
+    assert_eq!(out, "abc\n");
+
+    // fstat and ftruncate on an fd whose file was unlinked.
+    let f = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(mnt.join("new.txt"))
+        .unwrap();
+    fs::remove_file(mnt.join("new.txt")).unwrap();
+    assert_eq!(f.metadata().unwrap().len(), 4);
+    f.set_len(1).unwrap();
+    drop(f);
+
+    // A huge truncate of a value is refused, not fatal.
+    let (ok, _) = sh("truncate -s 1T 'd.json#/n' 2>/dev/null");
+    assert!(!ok);
+    assert!(sh("cat d.json").0, "the mount survived");
+
+    // truncate(2) to zero writes the empty value (a string here).
+    fs::write(m.backing.join("s.json"), "{\"a\": \"hello\"}\n").unwrap();
+    std::thread::sleep(Duration::from_millis(1100));
+    let (ok, _) = sh("truncate -s 0 's.json#/a'");
+    assert!(ok);
+    assert_eq!(
+        fs::read_to_string(m.backing.join("s.json")).unwrap(),
+        "{\"a\": \"\"}\n"
+    );
+
+    // Touching a FIFO doesn't hang; touching a symlink with -h leaves the target alone.
+    Command::new("mkfifo")
+        .arg(m.backing.join("pipe"))
+        .status()
+        .unwrap();
+    std::os::unix::fs::symlink("o1", m.backing.join("sl")).unwrap();
+    let before = fs::metadata(m.backing.join("o1")).unwrap().mtime();
+    let (ok, _) = sh("timeout 5 touch pipe && touch -h -d 2010-01-01 sl");
+    assert!(ok, "touch hung or failed");
+    assert_eq!(fs::metadata(m.backing.join("o1")).unwrap().mtime(), before);
+    assert_eq!(
+        fs::symlink_metadata(m.backing.join("sl")).unwrap().mtime(),
+        1_262_304_000
+    );
+
+    // An open value handle follows a rename of its file.
+    fs::write(m.backing.join("c.json"), "{\"n\": 1}\n").unwrap();
+    std::thread::sleep(Duration::from_millis(1100));
+    let mut h = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(mnt.join("c.json#/n"))
+        .unwrap();
+    fs::rename(mnt.join("c.json"), mnt.join("c2.json")).unwrap();
+    h.write_all(b"5\n").unwrap();
+    h.sync_all().unwrap();
+    drop(h);
+    assert_eq!(
+        fs::read_to_string(m.backing.join("c2.json")).unwrap(),
+        "{\"n\": 5}\n"
+    );
+
+    // chown is refused, not silently ignored.
+    let (ok, _) = sh("chown 12345 o1 2>/dev/null");
+    assert!(!ok);
+}

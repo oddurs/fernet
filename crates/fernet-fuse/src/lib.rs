@@ -40,6 +40,20 @@ const TTL_PRESENT: Duration = Duration::from_secs(1);
 /// History never changes; cache it longer.
 const TTL_PAST: Duration = Duration::from_secs(60);
 
+/// The largest value a `#` handle buffers. Bigger writes or truncates get
+/// `EFBIG` rather than an allocation the size of the request.
+const MAX_VALUE: usize = 16 << 20;
+
+#[cfg(target_os = "linux")]
+const ESTALE: i32 = 116;
+#[cfg(not(target_os = "linux"))]
+const ESTALE: i32 = 70;
+
+#[cfg(target_os = "linux")]
+const O_NONBLOCK: i32 = 0o4000;
+#[cfg(not(target_os = "linux"))]
+const O_NONBLOCK: i32 = 0x0004;
+
 /// "No such attribute": `ENODATA` on Linux, `ENOATTR` (93) on macOS.
 fn no_xattr() -> Errno {
     if cfg!(target_os = "linux") {
@@ -71,6 +85,8 @@ pub struct FernetFs {
     passthrough: std::sync::atomic::AtomicBool,
     /// Backing ids per inode, shared by its open handles.
     backing: Mutex<HashMap<u64, (Arc<fuser::BackingId>, usize)>>,
+    /// Whether the kernel passes `O_TRUNC` to open (no separate truncate).
+    atomic_trunc: std::sync::atomic::AtomicBool,
 }
 
 enum Handle {
@@ -88,14 +104,17 @@ enum Handle {
     /// `written` says whether `write` was called since open: a flush before
     /// any write (a shell's `dup2` then `close`) must not apply the buffer yet.
     Value {
-        node: Resolved,
+        /// The value's inode: resolved again at apply time, so a rename of
+        /// the file while the handle is open is followed.
+        ino: u64,
         buf: Vec<u8>,
         dirty: bool,
         written: bool,
     },
     /// A new key, inserted once written (or on release if never written).
     NewKey {
-        parent: Resolved,
+        /// The containing object's inode.
+        parent: u64,
         key: String,
         buf: Vec<u8>,
         ino: u64,
@@ -110,20 +129,44 @@ struct Node {
     resolved: Resolved,
     parent: u64,
     lookups: u64,
+    /// For real nodes, the backing file's (device, inode) when registered. A
+    /// path whose file has since been replaced gets a new FUSE inode.
+    ident: Option<(u64, u64)>,
 }
 
-/// Inodes keyed by resolved identity. Real paths keep their inode for the
-/// life of the mount; virtual nodes are dropped once the kernel forgets them.
+/// Inodes keyed by resolved identity. Real paths keep their inode while the
+/// same file lives there; a node whose path now names another file (replaced,
+/// unlinked, renamed over) is orphaned: out of `by_key`, kept in `by_ino` until
+/// the kernel forgets it.
 struct Inodes {
     by_ino: HashMap<u64, Node>,
     by_key: HashMap<Resolved, u64>,
     next: u64,
 }
 
+/// The (device, inode) of a real path, not following symlinks.
+fn ident_of(r: &Resolved) -> Option<(u64, u64)> {
+    match r {
+        Resolved::RealFile { path } | Resolved::RealDir { path } => {
+            fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino()))
+        }
+        _ => None,
+    }
+}
+
 impl Inodes {
+    /// The inode for `resolved`, registered without a lookup reference.
     fn get_or_insert(&mut self, resolved: Resolved, parent: u64) -> u64 {
+        let ident = ident_of(&resolved);
         if let Some(&ino) = self.by_key.get(&resolved) {
-            return ino;
+            let same = self
+                .by_ino
+                .get(&ino)
+                .is_some_and(|n| n.ident == ident || ident.is_none());
+            if same {
+                return ino;
+            }
+            self.orphan(&resolved);
         }
         let ino = self.next;
         self.next += 1;
@@ -134,41 +177,66 @@ impl Inodes {
                 resolved,
                 parent,
                 lookups: 0,
+                ident,
             },
         );
         ino
     }
 
-    /// After a rename, moves every real path under `from` to `to`, keeping
-    /// inode numbers.
+    /// Detaches `key` from its inode (the file there is gone or replaced).
+    /// The node lives on until the kernel forgets it.
+    fn orphan(&mut self, key: &Resolved) {
+        if let Some(ino) = self.by_key.remove(key)
+            && let Some(n) = self.by_ino.get(&ino)
+            && n.lookups == 0
+            && ino != INodeNo::ROOT.0
+        {
+            self.by_ino.remove(&ino);
+        }
+    }
+
+    /// After a rename, moves every real path under `from` to `to`, and every
+    /// value inside a moved file, keeping inode numbers. A replaced target
+    /// is orphaned.
     fn rename(&mut self, from: &Path, to: &Path) {
         let moved: Vec<(Resolved, u64)> = self
             .by_key
             .iter()
-            .filter_map(|(k, &ino)| match k {
-                Resolved::RealFile { path } | Resolved::RealDir { path }
-                    if path.starts_with(from) =>
-                {
-                    Some((k.clone(), ino))
-                }
-                _ => None,
+            .filter(|(k, _)| match k {
+                Resolved::RealFile { path }
+                | Resolved::RealDir { path }
+                | Resolved::Inside {
+                    source: Source::Present(path),
+                    ..
+                } => path.starts_with(from),
+                _ => false,
             })
+            .map(|(k, &ino)| (k.clone(), ino))
             .collect();
+        for (key, _) in &moved {
+            self.by_key.remove(key);
+        }
         for (old, ino) in moved {
-            self.by_key.remove(&old);
-            let new = match &old {
+            let new = match old {
                 Resolved::RealFile { path } => Resolved::RealFile {
-                    path: rebase(path, from, to),
+                    path: rebase(&path, from, to),
                 },
                 Resolved::RealDir { path } => Resolved::RealDir {
-                    path: rebase(path, from, to),
+                    path: rebase(&path, from, to),
                 },
-                other => other.clone(),
+                Resolved::Inside {
+                    source: Source::Present(path),
+                    pointer,
+                    node,
+                } => Resolved::Inside {
+                    source: Source::Present(rebase(&path, from, to)),
+                    pointer,
+                    node,
+                },
+                other => other,
             };
-            // A replaced target loses its old inode mapping.
-            if let Some(prev) = self.by_key.insert(new.clone(), ino) {
-                self.by_ino.remove(&prev);
-            }
+            self.orphan(&new);
+            self.by_key.insert(new.clone(), ino);
             if let Some(n) = self.by_ino.get_mut(&ino) {
                 n.resolved = new;
             }
@@ -227,21 +295,19 @@ fn system_time(nanos: i64) -> SystemTime {
     }
 }
 
-fn time_of(t: TimeOrNow) -> SystemTime {
-    match t {
-        TimeOrNow::SpecificTime(t) => t,
-        TimeOrNow::Now => SystemTime::now(),
-    }
-}
-
-/// Splices `data` into `buf` at `offset`, growing it with zeros as needed.
-fn write_into(buf: &mut Vec<u8>, offset: u64, data: &[u8]) {
-    let start = usize::try_from(offset).unwrap_or(usize::MAX);
-    let end = start.saturating_add(data.len());
+/// Splices `data` into `buf` at `offset`, growing it with zeros as needed,
+/// up to [`MAX_VALUE`].
+fn write_into(buf: &mut Vec<u8>, offset: u64, data: &[u8]) -> Result<(), Errno> {
+    let start = usize::try_from(offset).map_err(|_| Errno::EFBIG)?;
+    let end = start
+        .checked_add(data.len())
+        .filter(|&e| e <= MAX_VALUE)
+        .ok_or(Errno::EFBIG)?;
     if buf.len() < end {
         buf.resize(end, 0);
     }
     buf[start..end].copy_from_slice(data);
+    Ok(())
 }
 
 impl FernetFs {
@@ -272,6 +338,7 @@ impl FernetFs {
                 resolved: root,
                 parent: INodeNo::ROOT.0,
                 lookups: 1,
+                ident: None,
             },
         );
         Self {
@@ -286,6 +353,7 @@ impl FernetFs {
             gid,
             passthrough: std::sync::atomic::AtomicBool::new(false),
             backing: Mutex::new(HashMap::new()),
+            atomic_trunc: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -297,14 +365,46 @@ impl FernetFs {
             .map(|n| (n.resolved.clone(), n.parent))
     }
 
-    /// Registers a looked-up (or created) node, taking one lookup reference.
-    fn remember(&self, r: Resolved, parent: u64) -> u64 {
-        let mut inodes = self.inodes.lock().unwrap_or_else(PoisonError::into_inner);
-        let ino = inodes.get_or_insert(r, parent);
-        if let Some(n) = inodes.by_ino.get_mut(&ino) {
+    /// Registers a node without a lookup reference.
+    fn register(&self, r: Resolved, parent: u64) -> u64 {
+        self.inodes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert(r, parent)
+    }
+
+    /// Takes one kernel lookup reference on `ino` (after a successful reply).
+    fn add_ref(&self, ino: u64) {
+        if let Some(n) = self
+            .inodes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_ino
+            .get_mut(&ino)
+        {
             n.lookups += 1;
         }
-        ino
+    }
+
+    /// The (device, inode) a real node was registered with.
+    fn ident(&self, ino: u64) -> Option<(u64, u64)> {
+        self.inodes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_ino
+            .get(&ino)
+            .and_then(|n| n.ident)
+    }
+
+    /// Orphans the inode of a real path that was just removed.
+    fn forget_path(&self, path: &Path) {
+        let mut inodes = self.inodes.lock().unwrap_or_else(PoisonError::into_inner);
+        inodes.orphan(&Resolved::RealFile {
+            path: path.to_owned(),
+        });
+        inodes.orphan(&Resolved::RealDir {
+            path: path.to_owned(),
+        });
     }
 
     fn touch(&self, path: &Path) {
@@ -349,36 +449,57 @@ impl FernetFs {
         }
     }
 
+    /// Attributes of a real file from its metadata.
+    fn real_attr(ino: u64, m: &fs::Metadata) -> FileAttr {
+        let t = |s: i64, ns: i64| system_time(s.saturating_mul(1_000_000_000).saturating_add(ns));
+        FileAttr {
+            ino: INodeNo(ino),
+            size: m.len(),
+            blocks: m.blocks(),
+            atime: t(m.atime(), m.atime_nsec()),
+            mtime: t(m.mtime(), m.mtime_nsec()),
+            ctime: t(m.ctime(), m.ctime_nsec()),
+            crtime: m.created().unwrap_or(UNIX_EPOCH),
+            kind: kind_of(m.file_type()),
+            #[allow(clippy::cast_possible_truncation)] // Permission bits fit in 12 bits.
+            perm: (m.permissions().mode() & 0o7777) as u16,
+            #[allow(clippy::cast_possible_truncation)] // Link counts beyond u32 aren't real.
+            nlink: m.nlink() as u32,
+            uid: m.uid(),
+            gid: m.gid(),
+            #[allow(clippy::cast_possible_truncation)] // Device numbers fit in u32 on Linux and macOS.
+            rdev: m.rdev() as u32,
+            #[allow(clippy::cast_possible_truncation)] // Block sizes are small.
+            blksize: m.blksize() as u32,
+            flags: 0,
+        }
+    }
+
+    /// The backing file of an open real-file handle.
+    fn handle_file(&self, fh: u64) -> Option<File> {
+        let handles = self.handles.lock().unwrap_or_else(PoisonError::into_inner);
+        match handles.get(&fh) {
+            Some(Handle::Real { file, .. }) => file.try_clone().ok(),
+            _ => None,
+        }
+    }
+
+    /// Any open handle's file for real inode `ino` (`fstat` on an unlinked
+    /// file arrives without a handle).
+    fn any_open_file(&self, ino: u64) -> Option<File> {
+        let handles = self.handles.lock().unwrap_or_else(PoisonError::into_inner);
+        handles.values().find_map(|h| match h {
+            Handle::Real { file, ino: i, .. } if *i == ino => file.try_clone().ok(),
+            _ => None,
+        })
+    }
+
     /// Attributes and a cache lifetime for a node.
     fn attr(&self, ino: u64, r: &Resolved) -> Result<(FileAttr, Duration), Errno> {
         match r {
             Resolved::RealFile { path } | Resolved::RealDir { path } => {
                 let m = fs::symlink_metadata(path).map_err(Errno::from)?;
-                let t = |s: i64, ns: i64| {
-                    system_time(s.saturating_mul(1_000_000_000).saturating_add(ns))
-                };
-                let attr = FileAttr {
-                    ino: INodeNo(ino),
-                    size: m.len(),
-                    blocks: m.blocks(),
-                    atime: t(m.atime(), m.atime_nsec()),
-                    mtime: t(m.mtime(), m.mtime_nsec()),
-                    ctime: t(m.ctime(), m.ctime_nsec()),
-                    crtime: m.created().unwrap_or(UNIX_EPOCH),
-                    kind: kind_of(m.file_type()),
-                    #[allow(clippy::cast_possible_truncation)] // Permission bits fit in 12 bits.
-                    perm: (m.permissions().mode() & 0o7777) as u16,
-                    #[allow(clippy::cast_possible_truncation)] // Link counts beyond u32 aren't real.
-                    nlink: m.nlink() as u32,
-                    uid: m.uid(),
-                    gid: m.gid(),
-                    #[allow(clippy::cast_possible_truncation)] // Device numbers fit in u32 on Linux and macOS.
-                    rdev: m.rdev() as u32,
-                    #[allow(clippy::cast_possible_truncation)] // Block sizes are small.
-                    blksize: m.blksize() as u32,
-                    flags: 0,
-                };
-                Ok((attr, TTL_PRESENT))
+                Ok((Self::real_attr(ino, &m), TTL_PRESENT))
             }
             Resolved::PastFile { version, .. } => Ok((
                 self.virtual_attr(
@@ -452,15 +573,18 @@ impl FernetFs {
     }
 
     /// An inode number for a listed entry, without taking a lookup reference.
+    /// Real entries are registered (their inodes are stable); virtual ones
+    /// use a known inode if there is one, else a placeholder, so listing a
+    /// big file's keys doesn't grow the table.
     fn entry_ino(&self, dir: &Resolved, parent: u64, e: &Entry) -> u64 {
         match self.fernet.lookup(dir, &e.name) {
-            Ok(r) if r != Resolved::Missing => self
-                .inodes
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get_or_insert(r, parent),
-            // Something changed between listing and lookup: any non-zero value
-            // will do, the kernel looks the name up before using it.
+            Ok(r) if is_real(&r) => self.register(r, parent),
+            Ok(r) if r != Resolved::Missing => {
+                let inodes = self.inodes.lock().unwrap_or_else(PoisonError::into_inner);
+                inodes.by_key.get(&r).copied().unwrap_or(u64::MAX)
+            }
+            // Any non-zero value will do: the kernel looks a name up before
+            // using it.
             _ => u64::MAX,
         }
     }
@@ -481,11 +605,20 @@ impl FernetFs {
     }
 
     fn entry_reply(&self, r: &Resolved, parent: u64, reply: ReplyEntry) {
-        let ino = self.remember(r.clone(), parent);
+        let ino = self.register(r.clone(), parent);
         match self.attr(ino, r) {
-            Ok((attr, ttl)) => reply.entry(&ttl, &attr, Generation(0)),
+            Ok((attr, ttl)) => {
+                // The reference is the kernel's only once it has the entry.
+                self.add_ref(ino);
+                reply.entry(&ttl, &attr, Generation(0));
+            }
             Err(e) => reply.error(e),
         }
+    }
+
+    /// What an inode resolves to now (after any renames).
+    fn current(&self, ino: u64) -> Option<Resolved> {
+        self.node(INodeNo(ino)).map(|(r, _)| r)
     }
 
     /// Applies a buffered value or new key. On `flush` (`releasing` false)
@@ -495,15 +628,16 @@ impl FernetFs {
         let mut handles = self.handles.lock().unwrap_or_else(PoisonError::into_inner);
         match handles.get_mut(&fh) {
             Some(Handle::Value {
-                node,
+                ino,
                 buf,
                 dirty,
                 written,
             }) if *dirty && (*written || releasing) => {
                 let text = String::from_utf8(buf.clone()).map_err(|_| Errno::EINVAL)?;
-                let node = node.clone();
+                let ino = *ino;
                 *dirty = false;
                 drop(handles);
+                let node = self.current(ino).ok_or(Errno::ENOENT)?;
                 self.fernet.write_value(&node, &text).map_err(|e| errno(&e))
             }
             Some(Handle::NewKey {
@@ -515,7 +649,7 @@ impl FernetFs {
                 written,
             }) if !*inserted && (*written || releasing) => {
                 let text = String::from_utf8(buf.clone()).map_err(|_| Errno::EINVAL)?;
-                let (parent, key, ino) = (parent.clone(), key.clone(), *ino);
+                let (parent, key, ino) = (*parent, key.clone(), *ino);
                 *inserted = true;
                 *written = false;
                 drop(handles);
@@ -523,6 +657,7 @@ impl FernetFs {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .remove(&ino);
+                let parent = self.current(parent).ok_or(Errno::ENOENT)?;
                 self.fernet
                     .insert(&parent, &key, NewValue::Text(text))
                     .map_err(|e| errno(&e))
@@ -538,11 +673,12 @@ impl FernetFs {
             }) if *written => {
                 let text = String::from_utf8(buf.clone()).map_err(|_| Errno::EINVAL)?;
                 let (parent, name) = (
-                    parent.clone(),
+                    *parent,
                     fernet_fs_path::encode_token(key).unwrap_or_default(),
                 );
                 *written = false;
                 drop(handles);
+                let parent = self.current(parent).ok_or(Errno::ENOENT)?;
                 let node = self
                     .fernet
                     .lookup(&parent, OsStr::new(&name))
@@ -559,18 +695,20 @@ impl FernetFs {
     fn backing_for(
         &self,
         ino: u64,
-        reply: &ReplyOpen,
         file: &File,
+        open_backing: impl FnOnce(&File) -> std::io::Result<fuser::BackingId>,
     ) -> Option<Arc<fuser::BackingId>> {
         if !self.passthrough.load(Ordering::Relaxed) {
             return None;
         }
         let mut map = self.backing.lock().unwrap_or_else(PoisonError::into_inner);
+        // Inodes are per file identity (see `Inodes`), so a cached backing id
+        // always refers to the file this inode names.
         if let Some((id, count)) = map.get_mut(&ino) {
             *count += 1;
             return Some(Arc::clone(id));
         }
-        match reply.open_backing(file) {
+        match open_backing(file) {
             Ok(id) => {
                 let id = Arc::new(id);
                 map.insert(ino, (Arc::clone(&id), 1));
@@ -606,7 +744,12 @@ impl Filesystem for FernetFs {
     fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> std::io::Result<()> {
         // Pass O_TRUNC to open instead of a separate truncate, so `echo x >
         // file#/key` arrives as one open-write-close on a fresh buffer.
-        let _ = config.add_capabilities(fuser::InitFlags::FUSE_ATOMIC_O_TRUNC);
+        if config
+            .add_capabilities(fuser::InitFlags::FUSE_ATOMIC_O_TRUNC)
+            .is_ok()
+        {
+            self.atomic_trunc.store(true, Ordering::Relaxed);
+        }
         // Real files keep their page cache across opens (FOPEN_KEEP_CACHE);
         // the kernel drops it when a file's mtime or size changes, including
         // changes made outside the mount.
@@ -647,14 +790,33 @@ impl Filesystem for FernetFs {
             return;
         };
         n.lookups = n.lookups.saturating_sub(nlookup);
-        if n.lookups == 0 && ino != INodeNo::ROOT && !is_real(&n.resolved) {
+        if n.lookups == 0 && ino != INodeNo::ROOT {
             let key = n.resolved.clone();
-            inodes.by_ino.remove(&ino.0);
-            inodes.by_key.remove(&key);
+            let current = inodes.by_key.get(&key) == Some(&ino.0);
+            // Real nodes stay while their path still names them; virtual nodes
+            // and orphans go.
+            if !current || !is_real(&key) {
+                inodes.by_ino.remove(&ino.0);
+                if current {
+                    inodes.by_key.remove(&key);
+                }
+            }
         }
     }
 
-    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
+        // An open real file answers from its handle, even after it was
+        // unlinked or renamed over.
+        let file = fh
+            .and_then(|fh| self.handle_file(fh.0))
+            .or_else(|| self.any_open_file(ino.0));
+        let gone = matches!(self.node(ino), Some((Resolved::RealFile { path }, _)) if fs::symlink_metadata(&path).map(|m| (m.dev(), m.ino())).ok() != self.ident(ino.0));
+        if let Some(meta) = file
+            .filter(|_| fh.is_some() || gone)
+            .and_then(|f| f.metadata().ok())
+        {
+            return reply.attr(&TTL_PRESENT, &Self::real_attr(ino.0, &meta));
+        }
         let Some((r, _)) = self.node(ino) else {
             return reply.error(Errno::ENOENT);
         };
@@ -664,13 +826,14 @@ impl Filesystem for FernetFs {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // One FUSE operation; its checks read best in one place.
     fn setattr(
         &self,
         _req: &Request,
         ino: INodeNo,
         mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         size: Option<u64>,
         atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
@@ -685,76 +848,126 @@ impl Filesystem for FernetFs {
         let Some((r, _)) = self.node(ino) else {
             return reply.error(Errno::ENOENT);
         };
-        let changes = mode.is_some() || size.is_some() || atime.is_some() || mtime.is_some();
+        let changes = mode.is_some()
+            || size.is_some()
+            || atime.is_some()
+            || mtime.is_some()
+            || uid.is_some()
+            || gid.is_some();
         if changes && (!self.writable || r.is_past()) {
             return reply.error(Errno::EROFS);
         }
         let res: Result<(), Errno> = (|| {
             match &r {
                 Resolved::RealFile { path } | Resolved::RealDir { path } => {
+                    let handle = fh.and_then(|fh| self.handle_file(fh.0));
+                    let meta = match &handle {
+                        Some(f) => f.metadata(),
+                        None => fs::symlink_metadata(path),
+                    }
+                    .map_err(Errno::from)?;
+                    // Changing ownership needs privileges fernet doesn't use.
+                    if uid.is_some_and(|u| u != meta.uid()) || gid.is_some_and(|g| g != meta.gid())
+                    {
+                        return Err(Errno::EPERM);
+                    }
                     if let Some(m) = mode {
+                        if meta.file_type().is_symlink() {
+                            return Err(Errno::EOPNOTSUPP);
+                        }
                         fs::set_permissions(path, fs::Permissions::from_mode(m & 0o7777))
                             .map_err(Errno::from)?;
                     }
                     if let Some(len) = size {
-                        OpenOptions::new()
-                            .write(true)
-                            .open(path)
-                            .and_then(|f| f.set_len(len))
-                            .map_err(Errno::from)?;
+                        match &handle {
+                            Some(f) => f.set_len(len).map_err(Errno::from)?,
+                            // Non-blocking: a FIFO must not stall a worker.
+                            None => OpenOptions::new()
+                                .write(true)
+                                .custom_flags(O_NONBLOCK)
+                                .open(path)
+                                .and_then(|f| f.set_len(len))
+                                .map_err(Errno::from)?,
+                        }
                         self.touch(path);
                     }
                     if atime.is_some() || mtime.is_some() {
-                        let f = File::options()
-                            .write(true)
-                            .open(path)
-                            .or_else(|_| File::open(path))
-                            .map_err(Errno::from)?;
-                        let mut times = fs::FileTimes::new();
-                        if let Some(a) = atime {
-                            times = times.set_accessed(time_of(a));
-                        }
-                        if let Some(m) = mtime {
-                            times = times.set_modified(time_of(m));
-                        }
-                        f.set_times(times).map_err(Errno::from)?;
+                        // utimensat without following symlinks, without opening.
+                        let t = |v: Option<TimeOrNow>| match v {
+                            None => nix::sys::time::TimeSpec::UTIME_OMIT,
+                            Some(TimeOrNow::Now) => nix::sys::time::TimeSpec::UTIME_NOW,
+                            Some(TimeOrNow::SpecificTime(t)) => {
+                                let d = t.duration_since(UNIX_EPOCH).unwrap_or_default();
+                                nix::sys::time::TimeSpec::from_duration(d)
+                            }
+                        };
+                        nix::sys::stat::utimensat(
+                            nix::fcntl::AT_FDCWD,
+                            path.as_path(),
+                            &t(atime),
+                            &t(mtime),
+                            nix::sys::stat::UtimensatFlags::NoFollowSymlink,
+                        )
+                        .map_err(|e| Errno::from_i32(e as i32))?;
                     }
                 }
                 Resolved::Inside {
                     node: NodeKind::Scalar(_),
                     ..
                 } => {
+                    if mode.is_some() || uid.is_some() || gid.is_some() {
+                        return Err(Errno::EPERM);
+                    }
                     if let Some(len) = size {
+                        let len = usize::try_from(len)
+                            .ok()
+                            .filter(|&l| l <= MAX_VALUE)
+                            .ok_or(Errno::EFBIG)?;
                         let mut handles =
                             self.handles.lock().unwrap_or_else(PoisonError::into_inner);
                         match fh.and_then(|fh| handles.get_mut(&fh.0)) {
-                            Some(Handle::Value { buf, dirty, .. }) => {
-                                buf.resize(usize::try_from(len).unwrap_or(usize::MAX), 0);
+                            // An explicit truncate is a change: apply it at flush.
+                            Some(Handle::Value {
+                                buf,
+                                dirty,
+                                written,
+                                ..
+                            }) => {
+                                buf.resize(len, 0);
                                 *dirty = true;
+                                *written = true;
                             }
-                            Some(Handle::NewKey { buf, .. }) => {
-                                buf.resize(usize::try_from(len).unwrap_or(usize::MAX), 0);
+                            Some(Handle::NewKey { buf, written, .. }) => {
+                                buf.resize(len, 0);
+                                *written = true;
                             }
-                            // `O_TRUNC` without atomic truncation sends size 0 before the
-                            // open that writes the new value: nothing to do yet.
-                            _ if len == 0 => {}
+                            // `O_TRUNC` without atomic truncation sends size 0
+                            // before the open that writes: nothing to do yet.
+                            _ if len == 0 && !self.atomic_trunc.load(Ordering::Relaxed) => {}
                             _ => {
                                 drop(handles);
                                 // truncate(2) on a path: write the shortened value now.
                                 let mut cur = self.fernet.read(&r).map_err(|e| errno(&e))?;
-                                cur.resize(usize::try_from(len).unwrap_or(usize::MAX), 0);
+                                cur.resize(len, 0);
                                 let text = String::from_utf8(cur).map_err(|_| Errno::EINVAL)?;
                                 self.fernet.write_value(&r, &text).map_err(|e| errno(&e))?;
                             }
                         }
                     }
                 }
+                _ if mode.is_some() || uid.is_some() || gid.is_some() => return Err(Errno::EPERM),
                 _ => {}
             }
             Ok(())
         })();
         if let Err(e) = res {
             return reply.error(e);
+        }
+        if let Some(meta) = fh
+            .and_then(|fh| self.handle_file(fh.0))
+            .and_then(|f| f.metadata().ok())
+        {
+            return reply.attr(&TTL_PRESENT, &Self::real_attr(ino.0, &meta));
         }
         match self.attr(ino.0, &r) {
             Ok((mut attr, ttl)) => {
@@ -832,9 +1045,10 @@ impl Filesystem for FernetFs {
         let res = match &dir {
             Resolved::RealDir { path } => {
                 let p = path.join(name);
-                fs::remove_file(&p)
-                    .map_err(Errno::from)
-                    .map(|()| self.touch(&p))
+                fs::remove_file(&p).map_err(Errno::from).map(|()| {
+                    self.forget_path(&p);
+                    self.touch(&p);
+                })
             }
             Resolved::Inside { .. } => match self.fernet.lookup(&dir, name) {
                 Ok(Resolved::Missing) => Err(Errno::ENOENT),
@@ -855,7 +1069,12 @@ impl Filesystem for FernetFs {
             Err(e) => return reply.error(e),
         };
         let res = match &dir {
-            Resolved::RealDir { path } => fs::remove_dir(path.join(name)).map_err(Errno::from),
+            Resolved::RealDir { path } => {
+                let p = path.join(name);
+                fs::remove_dir(&p)
+                    .map_err(Errno::from)
+                    .map(|()| self.forget_path(&p))
+            }
             Resolved::Inside { .. } => match self.fernet.lookup(&dir, name) {
                 Ok(Resolved::Missing) => Err(Errno::ENOENT),
                 Ok(child) => self.fernet.remove(&child).map_err(|e| errno(&e)),
@@ -962,7 +1181,13 @@ impl Filesystem for FernetFs {
                     Ok(f) => f,
                     Err(e) => return reply.error(Errno::from(e)),
                 };
-                if let Some(id) = self.backing_for(ino.0, &reply, &file) {
+                // The path now names another file (replaced since lookup):
+                // ESTALE makes the kernel look it up again and get a fresh inode.
+                let opened = file.metadata().ok().map(|m| (m.dev(), m.ino()));
+                if opened.is_some() && self.ident(ino.0).is_some_and(|i| Some(i) != opened) {
+                    return reply.error(Errno::from_i32(ESTALE));
+                }
+                if let Some(id) = self.backing_for(ino.0, &file, |f| reply.open_backing(f)) {
                     // Writes bypass us under passthrough: assume a writable
                     // handle wrote, so release snapshots it.
                     let fh = self.new_handle(Handle::Real {
@@ -996,7 +1221,7 @@ impl Filesystem for FernetFs {
                     }
                 };
                 let fh = self.new_handle(Handle::Value {
-                    node: r.clone(),
+                    ino: ino.0,
                     buf,
                     dirty: trunc,
                     written: false,
@@ -1048,7 +1273,31 @@ impl Filesystem for FernetFs {
                     Err(e) => return reply.error(Errno::from(e)),
                 };
                 let r = Resolved::RealFile { path: p.clone() };
-                let ino = self.remember(r.clone(), parent.0);
+                let ino = self.register(r.clone(), parent.0);
+                let (attr, ttl) = match self.attr(ino, &r) {
+                    Ok(a) => a,
+                    Err(e) => return reply.error(e),
+                };
+                self.add_ref(ino);
+                // Same I/O mode as later opens of this inode: the kernel
+                // refuses to mix passthrough and cached opens on one inode.
+                if let Some(id) = self.backing_for(ino, &file, |f| reply.open_backing(f)) {
+                    let fh = self.new_handle(Handle::Real {
+                        file,
+                        path: p,
+                        written: true,
+                        ino,
+                        passthrough: true,
+                    });
+                    return reply.created_passthrough(
+                        &ttl,
+                        &attr,
+                        Generation(0),
+                        fh,
+                        FopenFlags::empty(),
+                        &id,
+                    );
+                }
                 let fh = self.new_handle(Handle::Real {
                     file,
                     path: p,
@@ -1056,12 +1305,7 @@ impl Filesystem for FernetFs {
                     ino,
                     passthrough: false,
                 });
-                match self.attr(ino, &r) {
-                    Ok((attr, ttl)) => {
-                        reply.created(&ttl, &attr, Generation(0), fh, FopenFlags::empty());
-                    }
-                    Err(e) => reply.error(e),
-                }
+                reply.created(&ttl, &attr, Generation(0), fh, FopenFlags::FOPEN_KEEP_CACHE);
             }
             Resolved::Inside {
                 source,
@@ -1085,13 +1329,13 @@ impl Filesystem for FernetFs {
                     pointer: ptr,
                     node: NodeKind::Scalar(fernet_fs_core::ScalarType::String),
                 };
-                let ino = self.remember(r.clone(), parent.0);
+                let ino = self.register(r.clone(), parent.0);
                 self.pending
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .insert(ino, 0);
                 let fh = self.new_handle(Handle::NewKey {
-                    parent: dir.clone(),
+                    parent: parent.0,
                     key,
                     buf: Vec::new(),
                     ino,
@@ -1100,6 +1344,7 @@ impl Filesystem for FernetFs {
                 });
                 match self.attr(ino, &r) {
                     Ok((attr, ttl)) => {
+                        self.add_ref(ino);
                         reply.created(&ttl, &attr, Generation(0), fh, FopenFlags::FOPEN_DIRECT_IO);
                     }
                     Err(e) => reply.error(e),
@@ -1159,28 +1404,35 @@ impl Filesystem for FernetFs {
         let mut handles = self.handles.lock().unwrap_or_else(PoisonError::into_inner);
         let n = u32::try_from(data.len()).unwrap_or(u32::MAX);
         match handles.get_mut(&fh.0) {
-            Some(Handle::Real { file, written, .. }) => match file.write_at(data, offset) {
-                Ok(w) => {
-                    *written = true;
-                    reply.written(u32::try_from(w).unwrap_or(u32::MAX));
+            Some(Handle::Real { file, written, .. }) => {
+                *written = true;
+                // No lock held across the syscall: other workers carry on.
+                let f = file.try_clone();
+                drop(handles);
+                match f.and_then(|f| f.write_at(data, offset)) {
+                    Ok(w) => reply.written(u32::try_from(w).unwrap_or(u32::MAX)),
+                    Err(e) => reply.error(Errno::from(e)),
                 }
-                Err(e) => reply.error(Errno::from(e)),
-            },
+            }
             Some(Handle::Value {
                 buf,
                 dirty,
                 written,
                 ..
-            }) => {
-                write_into(buf, offset, data);
-                *dirty = true;
-                *written = true;
-                reply.written(n);
-            }
+            }) => match write_into(buf, offset, data) {
+                Ok(()) => {
+                    *dirty = true;
+                    *written = true;
+                    reply.written(n);
+                }
+                Err(e) => reply.error(e),
+            },
             Some(Handle::NewKey {
                 buf, ino, written, ..
             }) => {
-                write_into(buf, offset, data);
+                if let Err(e) = write_into(buf, offset, data) {
+                    return reply.error(e);
+                }
                 *written = true;
                 let (ino, len) = (*ino, buf.len());
                 drop(handles);
@@ -1216,17 +1468,14 @@ impl Filesystem for FernetFs {
         datasync: bool,
         reply: ReplyEmpty,
     ) {
-        let res = {
-            let handles = self.handles.lock().unwrap_or_else(PoisonError::into_inner);
-            match handles.get(&fh.0) {
-                Some(Handle::Real { file, .. }) => if datasync {
-                    file.sync_data()
-                } else {
-                    file.sync_all()
-                }
-                .map_err(Errno::from),
-                _ => Ok(()),
+        let res = match self.handle_file(fh.0) {
+            Some(f) => if datasync {
+                f.sync_data()
+            } else {
+                f.sync_all()
             }
+            .map_err(Errno::from),
+            None => Ok(()),
         };
         match res.and_then(|()| self.apply(fh.0, false)) {
             Ok(()) => reply.ok(),
@@ -1250,20 +1499,28 @@ impl Filesystem for FernetFs {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&fh.0);
-        if let Some(Handle::Real {
-            path,
-            written,
-            ino,
-            passthrough,
-            ..
-        }) = handle
-        {
-            if passthrough {
-                self.release_backing(ino);
+        match handle {
+            Some(Handle::Real {
+                path,
+                written,
+                ino,
+                passthrough,
+                ..
+            }) => {
+                if passthrough {
+                    self.release_backing(ino);
+                }
+                if written {
+                    self.touch(&path);
+                }
             }
-            if written {
-                self.touch(&path);
+            Some(Handle::NewKey { ino, .. }) => {
+                self.pending
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&ino);
             }
+            _ => {}
         }
         match res {
             Ok(()) => reply.ok(),

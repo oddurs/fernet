@@ -609,3 +609,35 @@ or before the instant (a reverse range scan in both backends) instead of loading
 every version. Directory listings in the past and every `@` lookup get cheaper
 on long histories. The reindex property test compares the two backends'
 answers.
+
+## 55. Real inodes are keyed by path and file identity
+
+**Context.** A review found that real inodes were keyed by path alone. Once a
+path's file was replaced (by fernet's own temp+rename `#` writes, an editor's
+atomic save, or unlink plus recreate) while a handle was open, the new file
+shared the old kernel inode. Under passthrough that meant stale reads and
+writes that went to the unlinked file.
+
+**Decision.** Each real node records its backing file's (device, inode). A
+lookup that finds a different file at the path orphans the old node (it lives
+until the kernel forgets it) and registers a new inode. An open whose fd has a
+different identity than its node returns `ESTALE`, so the kernel looks the path
+up again. Unlink, rmdir and rename-over orphan the old node, and `rename`
+rebases value handles inside moved files. Passthrough backing ids stay keyed by
+inode, which is now per file. `create` uses passthrough too, because the kernel
+refuses to mix cached and passthrough opens on one inode. `fstat` and
+`ftruncate` on an open handle use the handle's file, so they keep working after
+an unlink.
+
+## 56. Hardening the mount's setattr and value buffers
+
+**Decision.** `#` value buffers are capped at 16 MiB (`EFBIG` above it), so a
+huge `truncate` or `pwrite` can't exhaust memory. Timestamps go through
+`utimensat` with `AT_SYMLINK_NOFOLLOW` (via `nix`, already in the tree through
+`fuser`), so `touch -h` on a symlink changes the link, not its target. Path
+truncates open with `O_NONBLOCK`, so a FIFO can't stall a worker thread.
+`chown` to another owner, and `chmod`/`chown` on virtual nodes, return `EPERM`
+instead of succeeding silently. An explicit `ftruncate` on a value applies at
+flush, like a write. Listing a large file's keys no longer adds inodes, and a
+lookup reference is taken only once the kernel has the entry. No lock is held
+across `write`/`fsync` syscalls.

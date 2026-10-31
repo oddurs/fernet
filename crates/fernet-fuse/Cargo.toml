@@ -33,6 +33,8 @@ broken_intra_doc_links = "deny"
 fernet-fs-core.workspace = true
 fernet-fs-formats.workspace = true
 fuser = "0.18"
+# Already in the tree through fuser; for utimensat without following symlinks.
+nix = { version = "0.31", default-features = false, features = ["fs"] }
 fernet-fs-store.workspace = true
 fernet-fs-path.workspace = true
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
