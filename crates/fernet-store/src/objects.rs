@@ -40,7 +40,11 @@ impl Objects {
         let parent = path
             .parent()
             .ok_or(Error::Layout("object path has no parent"))?;
-        fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+        if !parent.is_dir() {
+            fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+            // The new prefix directory's entry must be durable too.
+            sync_dir(&self.dir)?;
+        }
         let compressed = zstd::bulk::compress(bytes, LEVEL).map_err(|e| Error::io(&path, e))?;
         let tmp = parent.join(format!(
             ".tmp-{}-{}",
@@ -61,8 +65,16 @@ impl Objects {
     pub(crate) fn get(&self, hash: &Hash, size: u64) -> Result<Vec<u8>> {
         let path = self.path(hash);
         let compressed = fs::read(&path).map_err(|e| Error::io(&path, e))?;
-        let cap = usize::try_from(size).map_err(|_| Error::Layout("blob too large"))?;
-        let bytes = zstd::bulk::decompress(&compressed, cap.max(1))
+        // Streamed and bounded: a damaged record's size can't force a huge
+        // allocation.
+        let mut bytes = Vec::new();
+        zstd::stream::read::Decoder::new(&compressed[..])
+            .and_then(|d| {
+                std::io::Read::read_to_end(
+                    &mut std::io::Read::take(d, size.saturating_add(1)),
+                    &mut bytes,
+                )
+            })
             .map_err(|_| Error::BadBlob { hash: *hash })?;
         if bytes.len() as u64 != size || Hash::of(&bytes) != *hash {
             return Err(Error::BadBlob { hash: *hash });

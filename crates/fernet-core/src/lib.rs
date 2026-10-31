@@ -35,6 +35,18 @@ pub use time::Target;
 /// The name of the store directory, hidden from listings at the root.
 pub const STORE_DIR: &str = ".fernet";
 
+/// Whether `name` is the store directory's name. On macOS the default
+/// filesystem ignores case, so `.FERNET` is the store too.
+#[must_use]
+pub fn is_store_name(name: &OsStr) -> bool {
+    if cfg!(target_os = "macos") {
+        name.to_str()
+            .is_some_and(|n| n.eq_ignore_ascii_case(STORE_DIR))
+    } else {
+        name == STORE_DIR
+    }
+}
+
 /// Longest name a listing will show, in bytes (`NAME_MAX` on Linux and macOS).
 pub const NAME_MAX: usize = 255;
 
@@ -376,7 +388,7 @@ impl Fernet {
                 _ => Err(Error::OutsideRoot { path: "..".into() }),
             };
         }
-        if dir == self.root && name == STORE_DIR {
+        if dir == self.root && is_store_name(name) {
             return Ok(Resolved::Missing);
         }
         let real = dir.join(name);
@@ -716,7 +728,7 @@ impl Fernet {
                 for entry in fs::read_dir(path).map_err(|e| Error::io(path, e))? {
                     let entry = entry.map_err(|e| Error::io(path, e))?;
                     let name = entry.file_name();
-                    if path == &self.root && name == STORE_DIR {
+                    if path == &self.root && is_store_name(&name) {
                         continue;
                     }
                     let meta = fs::symlink_metadata(entry.path())

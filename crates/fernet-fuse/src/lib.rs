@@ -25,9 +25,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub use capture::{Capture, DEFAULT_WINDOW};
-use fernet_fs_core::{
-    Entry, EntryKind, Error, Fernet, NewValue, NodeKind, Resolved, STORE_DIR, Source,
-};
+use fernet_fs_core::{Entry, EntryKind, Error, Fernet, NewValue, NodeKind, Resolved, Source};
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, LockOwner,
     OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
@@ -598,7 +596,7 @@ impl FernetFs {
         if !self.writable || dir.is_past() {
             return Err(Errno::EROFS);
         }
-        if parent == INodeNo::ROOT && name == STORE_DIR {
+        if parent == INodeNo::ROOT && fernet_fs_core::is_store_name(name) {
             return Err(Errno::EACCES);
         }
         Ok(dir)

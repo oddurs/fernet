@@ -463,3 +463,60 @@ mod compaction {
         );
     }
 }
+
+/// A complete record with a valid checksum but an invalid field at the tail
+/// is corruption, not a torn write: it's reported and never truncated away.
+#[test]
+fn a_checksummed_bad_record_at_the_tail_is_corruption() {
+    let tmp = store_with(2);
+    let seg = seg_path(tmp.path(), 1);
+    let mut bytes = fs::read(&seg).unwrap();
+    let rec = Record {
+        kind: Kind::Write,
+        time: 9,
+        path: "x".into(),
+        hash: Hash([1; 32]),
+        size: 1,
+        extra: String::new(),
+    };
+    let mut enc = rec.encode().unwrap();
+    enc[9] = 1; // flags must be 0
+    let crc_at = enc.len() - 4;
+    let crc = crc32c::crc32c(&enc[8..crc_at]);
+    enc[crc_at..].copy_from_slice(&crc.to_le_bytes());
+    bytes.extend_from_slice(&enc);
+    fs::write(&seg, &bytes).unwrap();
+    assert!(!verify(tmp.path()).unwrap().ok());
+    assert!(Store::open(tmp.path(), Mode::Write).is_err());
+    assert_eq!(fs::read(&seg).unwrap(), bytes, "nothing was truncated");
+}
+
+/// A compaction that stops after its commit point leaves this handle's index
+/// matching the new log, even if the caller keeps appending.
+#[test]
+fn compaction_failure_after_commit_keeps_the_index_honest() {
+    use fernet_fs_store::compact::{CrashAfter, Policy};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Store::init(tmp.path()).unwrap();
+    const DAY: i64 = 86_400 * 1_000_000_000;
+    for i in 0..20 {
+        write(&mut s, "a", format!("v{i}").as_bytes(), i * DAY);
+    }
+    // Stop right after the manifest swap.
+    let steps_before_commit = 2;
+    let _ = s.compact_with(
+        400 * DAY,
+        &Policy::default(),
+        false,
+        Some(CrashAfter(steps_before_commit)),
+    );
+    write(&mut s, "a", b"after", 401 * DAY);
+    drop(s);
+    let s = Store::open(tmp.path(), Mode::Write).unwrap();
+    let versions = s.versions("a").unwrap();
+    let records = s.records().unwrap();
+    assert_eq!(versions.len(), records.len());
+    for v in &versions {
+        s.read(v).unwrap();
+    }
+}

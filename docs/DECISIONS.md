@@ -641,3 +641,29 @@ instead of succeeding silently. An explicit `ftruncate` on a value applies at
 flush, like a write. Listing a large file's keys no longer adds inodes, and a
 lookup reference is taken only once the kernel has the entry. No lock is held
 across `write`/`fsync` syscalls.
+
+## 57. History and store fixes from review
+
+**Decision.**
+- **Endings are recorded.** A missing path also tombstones every live path
+  under it, so a removed or moved directory doesn't stay "alive" in the past. A
+  path that is no longer a regular file (replaced by a directory, symlink or
+  other) gets a tombstone. A record is never stamped behind the path's latest
+  record: a tree capture's time is taken before its walk, and a concurrent
+  write may be newer.
+- **Writes resolve symlinks.** `#` writes and `fernet write` go to the link's
+  target (canonicalized; refused if it's outside the root), and the per-file
+  lock is keyed on the canonical path. Temp files get unique names
+  (`create_new`, process id and a counter, stem cut to fit `NAME_MAX`).
+- **Append failures roll back.** A partial write is truncated off the active
+  segment, so later records follow the last whole one. The index is updated
+  before a group-commit fsync can fail.
+- **Compaction reindexes at its commit point**, before deleting anything.
+- **A checksum-valid record with a bad field is corruption**, even at the
+  tail; only truncated or crc-failing tails are torn writes (FORMAT.md §6 as
+  written).
+- **Durability and bounds:** creating a new `objects/ab/` directory fsyncs
+  `objects/`, and blob decompression is streamed and bounded by the record's
+  size.
+- **`.fernet` on macOS** is matched case-insensitively, since the default APFS
+  ignores case.
