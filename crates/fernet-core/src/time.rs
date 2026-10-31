@@ -62,6 +62,16 @@ pub fn resolve(
         TimeSpec::Listing => Target::Listing,
         TimeSpec::Back(n) => Target::Back(*n),
         TimeSpec::First => Target::First,
+        TimeSpec::Now => Target::At(nanos(now)),
+        // The whole second: a version listed under this name is selected.
+        TimeSpec::Stamp(st) => {
+            let a = AbsoluteTime {
+                date: st.date,
+                time: Some(st.time),
+                offset: Some(Offset::Utc),
+            };
+            Target::At(absolute(&a, tz).saturating_add(999_999_999))
+        }
         TimeSpec::Mark(m) => Target::At(*marks.get(m.as_str()).ok_or_else(|| Error::NoMark {
             name: m.to_string(),
         })?),
@@ -231,6 +241,11 @@ mod tests {
         let r = |s: &str| resolve(&TimeSpec::parse(s).unwrap(), now, &ny(), &marks);
         assert_eq!(r("~3").unwrap(), Target::Back(3));
         assert_eq!(r("first").unwrap(), Target::First);
+        assert_eq!(r("now").unwrap(), Target::At(nanos(now)));
+        assert_eq!(
+            r("20261030T120000Z").unwrap(),
+            Target::At(ts("2026-10-30T12:00:00.999999999Z"))
+        );
         assert_eq!(r("").unwrap(), Target::Listing);
         assert_eq!(r("release").unwrap(), Target::At(42));
         assert!(matches!(r("nope"), Err(Error::NoMark { .. })));

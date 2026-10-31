@@ -583,3 +583,29 @@ macFUSE headers). It packages each with the licenses, README and completion
 scripts plus a SHA-256. Tags `v*` publish a GitHub release; a manual run only
 uploads artifacts. No tag has been pushed: publishing 1.0 is the maintainer's
 call.
+
+## 52. `@now` and listing names as time specs
+
+**Context.** PLAN.md Q10. `ls notes.md@` names versions `20261030T164512Z`,
+but those names didn't work after `@`, and `now` was reserved without meaning
+anything.
+
+**Decision.** Two grammar forms. `@now` is the present (the latest version, as
+an `@` path, so read-only). `@YYYYMMDDTHHMMSSZ` is a UTC second and resolves to
+the end of that second, so the version a listing shows under that name is
+always selected. Both are canonical-only, like every spec (DECISIONS 7).
+
+## 53. Gzip-compressed tar
+
+**Decision.** The tar driver claims `.tgz` and `.gz` and unpacks gzip (via
+`flate2`, already in the tree through `zip`, same backend) before reading the
+tar inside, under the same 256 MiB cap. A `.gz` that isn't a tarball is
+reported as such.
+
+## 54. Point-in-time lookups use a reverse range scan
+
+**Decision.** `Store::version_at` asks the index for the last row of `path` at
+or before the instant (a reverse range scan in both backends) instead of loading
+every version. Directory listings in the past and every `@` lookup get cheaper
+on long histories. The reindex property test compares the two backends'
+answers.

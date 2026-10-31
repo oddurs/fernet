@@ -33,8 +33,8 @@ use std::fmt;
 pub use component::Component;
 pub use pointer::{decode_token, encode_token};
 pub use timespec::{
-    AbsoluteTime, Date, DayName, InvalidMarkName, MarkName, Offset, RESERVED_WORDS, TimeOfDay,
-    TimeSpec, Unit,
+    AbsoluteTime, Date, DayName, InvalidMarkName, MarkName, Offset, RESERVED_WORDS, Stamp,
+    TimeOfDay, TimeSpec, Unit,
 };
 
 /// A parsed fernet path: a non-empty list of components.

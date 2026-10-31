@@ -12,7 +12,7 @@ pub const MAX_UNPACKED: u64 = 256 << 20;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Zip;
 
-/// The tar driver (uncompressed tar).
+/// The tar driver: plain tar, and gzip-compressed tar (`.tar.gz`, `.tgz`).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Tar;
 
@@ -131,7 +131,8 @@ impl Driver for Tar {
     }
 
     fn extensions(&self) -> &'static [&'static str] {
-        &["tar"]
+        // `.gz` alone may not be a tarball; `parse` says so if it isn't.
+        &["tar", "tgz", "gz"]
     }
 
     fn sniff(&self, head: &[u8]) -> bool {
@@ -139,6 +140,24 @@ impl Driver for Tar {
     }
 
     fn parse(&self, src: &[u8]) -> Result<Tree, DriverError> {
+        let unpacked;
+        let src = if src.starts_with(&[0x1f, 0x8b]) {
+            let mut out = Vec::new();
+            flate2::read::GzDecoder::new(src)
+                .take(MAX_UNPACKED + 1)
+                .read_to_end(&mut out)
+                .map_err(|e| bad(format!("gzip: {e}").to_lowercase()))?;
+            if out.len() as u64 > MAX_UNPACKED {
+                return Err(DriverError::Unsupported("archive too large to open"));
+            }
+            if out.get(257..262) != Some(b"ustar") && !out.is_empty() {
+                return Err(bad("gzip file isn't a tar archive"));
+            }
+            unpacked = out;
+            &unpacked[..]
+        } else {
+            src
+        };
         let mut a = tar::Archive::new(Cursor::new(src));
         let mut entries = Vec::new();
         let mut total = 0u64;
@@ -221,5 +240,15 @@ mod tests {
         let t = Tar.parse(&bytes).unwrap();
         let id = t.get(&["src".into(), "main.rs".into()]).unwrap();
         assert_eq!(t.render(id).unwrap(), b"fn\n");
+        // Gzip-compressed.
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&bytes).unwrap();
+        let t = Tar.parse(&gz.finish().unwrap()).unwrap();
+        let id = t.get(&["src".into(), "main.rs".into()]).unwrap();
+        assert_eq!(t.render(id).unwrap(), b"fn\n");
+        // A gzip file that isn't a tarball.
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(b"just text").unwrap();
+        assert!(Tar.parse(&gz.finish().unwrap()).is_err());
     }
 }

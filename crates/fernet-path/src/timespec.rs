@@ -29,6 +29,11 @@ pub enum TimeSpec {
     Back(u32),
     /// `first`: the earliest kept version.
     First,
+    /// `now`: the present (the latest version).
+    Now,
+    /// `20261030T164512Z`: a UTC second in ISO 8601 basic format, as version
+    /// listings name versions. Covers the whole second.
+    Stamp(Stamp),
     /// A named mark (a tephra layer).
     Mark(MarkName),
     /// The empty spec: a directory listing every kept version.
@@ -311,11 +316,16 @@ impl TimeSpec {
         if s == "first" {
             return Some(Self::First);
         }
+        if s == "now" {
+            return Some(Self::Now);
+        }
         if let Some(day) = DayName::ALL.into_iter().find(|d| d.as_str() == s) {
             return Some(Self::NamedDay(day));
         }
         if s.as_bytes()[0].is_ascii_digit() {
-            return parse_absolute(s).map(Self::Absolute);
+            return parse_absolute(s)
+                .map(Self::Absolute)
+                .or_else(|| parse_stamp(s).map(Self::Stamp));
         }
         MarkName::new(s).ok().map(Self::Mark)
     }
@@ -368,6 +378,51 @@ fn two(b: &[u8]) -> Option<u8> {
         return None;
     }
     fixed(b).and_then(|v| u8::try_from(v).ok())
+}
+
+/// A UTC second in ISO 8601 basic format: `YYYYMMDDTHHMMSSZ`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Stamp {
+    /// The date.
+    pub date: Date,
+    /// The time, with seconds.
+    pub time: TimeOfDay,
+}
+
+fn parse_stamp(s: &str) -> Option<Stamp> {
+    let b = s.as_bytes();
+    if b.len() != 16 || b[8] != b'T' || b[15] != b'Z' {
+        return None;
+    }
+    let date = Date::new(fixed(&b[..4])?, two(&b[4..6])?, two(&b[6..8])?)?;
+    let (hour, minute, second) = (two(&b[9..11])?, two(&b[11..13])?, two(&b[13..15])?);
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    Some(Stamp {
+        date,
+        time: TimeOfDay {
+            hour,
+            minute,
+            second: Some(second),
+        },
+    })
+}
+
+impl fmt::Display for Stamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Date { year, month, day } = self.date;
+        let TimeOfDay {
+            hour,
+            minute,
+            second,
+        } = self.time;
+        write!(
+            f,
+            "{year:04}{month:02}{day:02}T{hour:02}{minute:02}{:02}Z",
+            second.unwrap_or(0)
+        )
+    }
 }
 
 fn parse_absolute(s: &str) -> Option<AbsoluteTime> {
@@ -435,6 +490,8 @@ impl fmt::Display for TimeSpec {
             Self::Absolute(a) => a.fmt(f),
             Self::Back(n) => write!(f, "~{n}"),
             Self::First => f.write_str("first"),
+            Self::Now => f.write_str("now"),
+            Self::Stamp(st) => st.fmt(f),
             Self::Mark(m) => m.fmt(f),
             Self::Listing => Ok(()),
         }
@@ -542,6 +599,24 @@ mod tests {
     }
 
     #[test]
+    fn now_and_stamps() {
+        assert_eq!(p("now"), Some(TimeSpec::Now));
+        roundtrips("now");
+        roundtrips("20261030T164512Z");
+        roundtrips("00000101T000000Z");
+        for s in [
+            "20261030T164512",
+            "20261030T246000Z",
+            "20260230T000000Z",
+            "2026103T164512Z",
+            "20261030t164512Z",
+            "20261030T164512Z1",
+        ] {
+            assert_eq!(p(s), None, "{s:?}");
+        }
+    }
+
+    #[test]
     fn listing() {
         assert_eq!(p(""), Some(TimeSpec::Listing));
         assert_eq!(TimeSpec::Listing.to_string(), "");
@@ -586,7 +661,6 @@ mod tests {
             "2026-10-01T14:30+0200",
             "2026-10-01T14:30+24:00",
             "2026-10-01T14:30:05.5Z",
-            "20261030T164512Z",
             "2026-10-01T14:30Z ",
         ] {
             assert_eq!(p(s), None, "{s:?}");
@@ -605,7 +679,7 @@ mod tests {
         let max = format!("a{}", "b".repeat(63));
         roundtrips(&max);
         assert_eq!(p(&format!("{max}c")), None);
-        for s in ["now", "Release", "2fast", "-x", "a_b", "a.b", "a b", "é"] {
+        for s in ["Release", "2fast", "-x", "a_b", "a.b", "a b", "é"] {
             assert!(!matches!(p(s), Some(TimeSpec::Mark(_))), "{s:?}");
         }
         for w in RESERVED_WORDS {

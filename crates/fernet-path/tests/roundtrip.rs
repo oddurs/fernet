@@ -48,6 +48,14 @@ fn timespec() -> impl Strategy<Value = TimeSpec> {
         absolute().prop_map(TimeSpec::Absolute),
         (1u32..).prop_map(TimeSpec::Back),
         Just(TimeSpec::First),
+        Just(TimeSpec::Now),
+        absolute().prop_filter_map("stamp", |a| Some(TimeSpec::Stamp(fernet_fs_path::Stamp {
+            date: a.date,
+            time: TimeOfDay {
+                second: Some(a.time?.second.unwrap_or(0)),
+                ..a.time?
+            },
+        }))),
         "[a-z][a-z0-9-]{0,63}"
             .prop_filter_map("mark", |s| MarkName::new(&s).ok().map(TimeSpec::Mark)),
         Just(TimeSpec::Listing),

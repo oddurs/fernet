@@ -119,6 +119,10 @@ fn every_spec_form_across_dst() {
         ("~4", "one"),
         ("first", "one"),
         ("pre-dst", "three"),
+        ("now", "five"),
+        // Listing names work as specs and cover their whole second.
+        ("20260308T063000Z", "three"),
+        ("20260308T062959Z", "two"),
     ];
     for (spec, want) in cases {
         assert_eq!(

@@ -63,6 +63,9 @@ type Row = (String, i64, u64, VersionId, Option<Hash>, u64);
 pub(crate) trait Tables {
     /// Versions of `path`, oldest first.
     fn versions(&self, path: &str) -> Result<Vec<Version>>;
+    /// The latest version of `path` at or before `time`: a reverse range
+    /// scan that stops at the first row.
+    fn version_at(&self, path: &str, time: i64) -> Result<Option<Version>>;
     /// Distinct paths starting with `prefix`, sorted.
     fn paths(&self, prefix: &str) -> Result<Vec<String>>;
     /// Every mark and its time.
@@ -120,6 +123,16 @@ pub(crate) struct MemIndex {
 }
 
 impl Tables for MemIndex {
+    fn version_at(&self, path: &str, time: i64) -> Result<Option<Version>> {
+        let lo = (path.to_owned(), i64::MIN, 0);
+        let hi = (path.to_owned(), time, u64::MAX);
+        Ok(self
+            .rows
+            .range(lo..=hi)
+            .next_back()
+            .map(|((p, t, o), (id, h, s))| version((p.clone(), *t, *o, *id, *h, *s))))
+    }
+
     fn versions(&self, path: &str) -> Result<Vec<Version>> {
         let lo = (path.to_owned(), i64::MIN, 0);
         let hi = (path.to_owned(), i64::MAX, u64::MAX);
@@ -272,6 +285,21 @@ impl DiskIndex {
 }
 
 impl Tables for DiskIndex {
+    fn version_at(&self, path: &str, time: i64) -> Result<Option<Version>> {
+        let txn = self.db.begin_read().map_err(db_err)?;
+        let t = txn.open_table(VERSIONS).map_err(db_err)?;
+        let mut range = t
+            .range((path, i64::MIN, 0)..=(path, time, u64::MAX))
+            .map_err(db_err)?;
+        let Some(item) = range.next_back() else {
+            return Ok(None);
+        };
+        let (k, v) = item.map_err(db_err)?;
+        let (p, time, ord) = k.value();
+        let (id, hash, size) = unpack(&v.value());
+        Ok(Some(version((p.to_owned(), time, ord, id, hash, size))))
+    }
+
     fn versions(&self, path: &str) -> Result<Vec<Version>> {
         let txn = self.db.begin_read().map_err(db_err)?;
         let t = txn.open_table(VERSIONS).map_err(db_err)?;

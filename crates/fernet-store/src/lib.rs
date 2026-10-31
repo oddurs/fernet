@@ -616,12 +616,7 @@ impl Store {
     ///
     /// Index errors.
     pub fn version_at(&self, path: &str, time: i64) -> Result<Option<Version>> {
-        Ok(self
-            .index
-            .versions(path)?
-            .into_iter()
-            .rev()
-            .find(|v| v.time <= time))
+        self.index.version_at(path, time)
     }
 
     /// Every path with history that starts with `prefix`, sorted.
@@ -705,6 +700,9 @@ struct Recorder(Vec<(VersionId, Record)>);
 impl Tables for Recorder {
     fn versions(&self, _: &str) -> Result<Vec<Version>> {
         Ok(Vec::new())
+    }
+    fn version_at(&self, _: &str, _: i64) -> Result<Option<Version>> {
+        Ok(None)
     }
     fn paths(&self, _: &str) -> Result<Vec<String>> {
         Ok(Vec::new())
