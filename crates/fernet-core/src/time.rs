@@ -102,6 +102,11 @@ pub fn resolve(
             };
             Target::At(start_of_day(date, tz))
         }
+        // With seconds, the whole second: `fernet log` shows times truncated
+        // to the second, and a time copied from it must select that version.
+        TimeSpec::Absolute(a) if a.time.is_some_and(|t| t.second.is_some()) => {
+            Target::At(absolute(a, tz).saturating_add(999_999_999))
+        }
         TimeSpec::Absolute(a) => Target::At(absolute(a, tz)),
     })
 }
@@ -227,7 +232,11 @@ mod tests {
         let now = "2026-10-30T16:00:00Z";
         assert_eq!(at("2026-10-01", now), ts("2026-10-01T04:00:00Z"));
         assert_eq!(at("2026-10-01T14:30", now), ts("2026-10-01T18:30:00Z"));
-        assert_eq!(at("2026-10-01T14:30:05Z", now), ts("2026-10-01T14:30:05Z"));
+        // With seconds: the whole second.
+        assert_eq!(
+            at("2026-10-01T14:30:05Z", now),
+            ts("2026-10-01T14:30:05.999999999Z")
+        );
         assert_eq!(
             at("2026-10-01T14:30+02:00", now),
             ts("2026-10-01T12:30:00Z")

@@ -639,3 +639,23 @@ fn watch_ignores_symlinked_directories_and_reincluded_files() {
         assert!(!final_log.contains(bad), "{bad} captured:\n{final_log}");
     }
 }
+
+#[test]
+fn a_time_copied_from_log_selects_that_version() {
+    let tmp = history_fixture();
+    let p = tmp.path();
+    for v in ["v2", "v3"] {
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fernet(p).args(["write", "notes.md", v]).assert().success();
+        let out = fernet(p).args(["log", "notes.md"]).output().unwrap();
+        let log = String::from_utf8(out.stdout).unwrap();
+        let mut words = log.lines().next().unwrap().split_whitespace();
+        let (date, time) = (words.next().unwrap(), words.next().unwrap());
+        fernet(p)
+            .arg("cat")
+            .arg(format!("notes.md@{date}T{time}"))
+            .assert()
+            .success()
+            .stdout(v);
+    }
+}

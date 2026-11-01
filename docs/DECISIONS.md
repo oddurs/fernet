@@ -886,3 +886,14 @@ directory is ignored whatever later patterns say. Then the path itself.
 so a version at `…:15.6` was shown as `…:16`, a second after it happened, and
 disagreed with version names, which truncate. Log stamps now truncate: the
 display never shows a time later than the version's instant.
+
+## 70. An absolute time with seconds covers the whole second
+
+**Context.** `fernet log` shows times truncated to the second (decision 69).
+A time copied from it, used as `@2026-10-30T16:45:12`, resolved to the start
+of that second and picked the previous version unless the version was at
+exactly `.000`.
+
+**Decision.** An absolute spec with explicit `:SS` resolves to the end of that
+second. Without seconds (`T16:45`, a bare date) it still means the start of
+the minute or day. Stamps select their listing entry (decision 52).

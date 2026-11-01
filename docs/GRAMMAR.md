@@ -50,11 +50,11 @@ and no leading zeros.
 | --- | --- | --- | --- |
 | relative | `-` *N* *unit*, unit in `s m h d w` | `-90s`, `-2h`, `-3d`, `-2w` | now minus the duration (`d` = 24 h, `w` = 7 d). `-0s` is now |
 | named day | `yesterday`, `monday` … `sunday` | `@yesterday` | 00:00 local time at the start of that day; the most recent past one (`@monday` on a Monday is one week ago) |
-| absolute | `YYYY-MM-DD` [`THH:MM`[`:SS`] [`Z` \| `±HH:MM`]] | `2026-10-01`, `2026-10-01T14:30:05Z` | local time unless an offset is given. Dates are calendar-checked; hours 00–23, minutes and seconds 00–59; offsets only with a time |
+| absolute | `YYYY-MM-DD` [`THH:MM`[`:SS`] [`Z` \| `±HH:MM`]] | `2026-10-01`, `2026-10-01T14:30:05Z` | local time unless an offset is given. With `:SS` the spec covers that whole second (a time copied from `fernet log` selects the version it shows). Dates are calendar-checked; hours 00–23, minutes and seconds 00–59; offsets only with a time |
 | count | `~` *N*, N ≥ 1 | `@~3` | N versions before the current one |
 | first | `first` | `@first` | the earliest kept version |
 | now | `now` | `@now` | the present: the latest version (read-only, like every `@` path) |
-| stamp | `YYYYMMDD` `T` `HHMMSS` `Z` | `@20261030T164512Z` | a UTC second, as version listings name versions; covers the whole second, so the listed version is selected |
+| stamp | `YYYYMMDD` `T` `HHMMSS` `Z` | `@20261030T164512Z` | a UTC second, as version listings name versions; selects the version listed under that name (the first in that second) |
 | mark | `[a-z][a-z0-9-]{0,63}` | `@before-migration` | a named mark |
 | listing | empty | `notes.md@` | a directory listing every kept version |
 
