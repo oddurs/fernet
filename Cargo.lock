@@ -504,6 +504,7 @@ dependencies = [
  "redb",
  "tempfile",
  "thiserror",
+ "toml_edit",
  "tracing",
  "zstd",
 ]

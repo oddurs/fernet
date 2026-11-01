@@ -302,6 +302,8 @@ list from `config.toml` with a line scan rather than a TOML parser, to keep
 one setting per line. Malformed values fall back to defaults. If `config.toml`
 grows nested structure, switch to `toml_edit`, which is already in the tree.
 
+Superseded by decision 71.
+
 ## 28. The watcher
 
 **Decision.** `fernet watch` takes the writer lock, captures the whole tree once
@@ -347,6 +349,8 @@ access against the modes we report: real modes for real files, `0444`/`0555` for
 everything virtual. The mount opens the store in read mode. That takes the
 writer lock when it's free (one writer per store), so `fernet watch` and a
 mount don't run at the same time. In v0.4 the mount itself becomes the writer.
+
+Since decision 72, read mode never takes the lock.
 
 ## 33. `fernet mount` signals and `--daemon`
 
@@ -690,3 +694,60 @@ across `write`/`fsync` syscalls.
 - **CLI**: `fernet write` reads stdin as bytes (real files may be binary;
   values must be UTF-8). Bash completion completes the whole word, including
   `@` and `:`, which are in bash's `COMP_WORDBREAKS`.
+
+## 70. A kept tombstone keeps the content it ended
+
+**Context.** Retention keeps the latest record per bucket and the newest
+record per path, and tombstones counted as records. A file written twice and
+deleted within one hour came out of compaction as a bare tombstone, with both
+blobs gone: the file's last content was lost.
+
+**Decision.** `compact::plan` first applies the policy as FORMAT.md §8 states
+it, then, for every kept tombstone of a path (a `delete`, or a `rename` away
+from it), also keeps the newest content record of that path before it. This
+repeats until nothing changes, because keeping a `rename` for its new path can
+make it a kept tombstone for its old one. It only ever adds records, so §8's
+promise and decision 42's "never less" hold. Tombstones still compete in
+buckets: the state at the end of a bucket ("deleted") stays answerable.
+
+## 71. `config.toml` is parsed as TOML
+
+**Context.** Decision 27 read settings with a line scan. Anything a person
+writes by hand in a TOML file (`'*.log'`, a trailing `# comment`, a multi-line
+array, `retention = { … }`) was silently ignored and the default used, so
+compaction could drop more than configured.
+
+**Decision.** `fernet-fs-store` parses `config.toml` with `toml_edit` (already
+in the tree for the TOML driver; only its `parse` feature), replacing decision
+27. Settings are read from the table FORMAT.md §7 names; unknown keys are
+ignored as before. A file that doesn't parse, or a known setting of the wrong
+type, is a *config problem*: readers use defaults for what they can't read and
+the CLI prints a warning naming it, while `compact` refuses (`Error::Config`),
+because guessing a shorter retention would delete history.
+
+## 72. Readers never take the writer lock
+
+**Context.** Decision 23 said readers and the writer never block each other,
+but `Mode::Read` took the exclusive lock whenever it was free (to use the
+persistent index). A `fernet cat` or a completion running at the wrong moment
+made `fernet compact`, `fernet mark` or `fernet watch` fail as busy. Opening the
+lock file for writing also made a read-only store (`chmod -R a-w .fernet`)
+unreadable.
+
+**Decision.** `Mode::Read` never opens the lock file or the redb index, and
+writes nothing: it always replays the log into memory. Only `Mode::Write`
+locks. A read-only mount is therefore a plain reader and no longer excludes a
+watcher (decision 32's note is superseded). A lock-less reader can race a
+compaction that retires the segments its manifest listed; when a listed
+segment is missing, the open (and `Store::records`) starts over from a fresh
+`MANIFEST`, up to eight times with a short back-off.
+
+**Consequences.** Every read-only command pays a full log replay, as decision
+23 already accepted for readers that couldn't get the lock.
+
+## 73. Damaged blobs are repaired on put
+
+**Decision.** `put_blob` used to trust any file already at a blob's path. It
+now decompresses and hashes the existing file, and rewrites it atomically if it
+doesn't match, so a capture of the same content repairs the damage instead of
+pointing new records at it.

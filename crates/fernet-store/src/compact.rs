@@ -12,9 +12,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::record::{Kind, Record};
-use crate::{
-    Error, Hash, Result, Store, VersionId, config_u64, segment, write_atomic, write_manifest,
-};
+use crate::{Config, Error, Hash, Result, Store, VersionId, segment, write_atomic, write_manifest};
 
 const HOUR: i64 = 3_600 * 1_000_000_000;
 const DAY: i64 = 24 * HOUR;
@@ -49,9 +47,28 @@ impl Policy {
     /// `ice_days`), defaults for anything missing.
     #[must_use]
     pub fn from_config(dir: &Path) -> Self {
+        Self::from_parsed(&Config::load(dir))
+    }
+
+    /// [`Policy::from_config`], but an unreadable `config.toml` is an error:
+    /// guessing defaults could drop history the user configured to keep.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] naming what couldn't be read.
+    pub fn load(dir: &Path) -> Result<Self> {
+        let config = Config::load(dir);
+        if let Some(problem) = config.problems().first() {
+            return Err(Error::Config(problem.clone()));
+        }
+        Ok(Self::from_parsed(&config))
+    }
+
+    fn from_parsed(config: &Config) -> Self {
         let d = Self::default();
         let n = |k: &str, unit: i64, default: i64| {
-            config_u64(dir, k)
+            config
+                .u64(k)
                 .and_then(|v| i64::try_from(v).ok())
                 .map_or(default, |v| v.saturating_mul(unit))
         };
@@ -98,7 +115,20 @@ fn paths_of(r: &Record) -> Vec<&str> {
     }
 }
 
+/// Whether `r` ends `path`'s content: a delete, or a rename away from it.
+fn ends(r: &Record, path: &str) -> bool {
+    match r.kind {
+        Kind::Delete => true,
+        Kind::Rename => r.path != path,
+        _ => false,
+    }
+}
+
 /// Which records (by position in log order) survive `policy` at `now`.
+///
+/// A kept tombstone also keeps the newest content version before it, so
+/// thinning never turns "edited, then deleted" into "deleted" with the last
+/// content gone.
 #[must_use]
 pub fn plan(records: &[(VersionId, Record)], now: i64, policy: &Policy) -> BTreeSet<usize> {
     // Live marks: the latest mark record per name, unless an unmark follows it.
@@ -149,7 +179,28 @@ pub fn plan(records: &[(VersionId, Record)], now: i64, policy: &Policy) -> BTree
         }
         keep.extend(latest.into_values());
     }
-    keep
+    // Every kept tombstone keeps the content it ended. Keeping a rename can
+    // make it a kept tombstone for its old path, so repeat until stable.
+    loop {
+        let before = keep.len();
+        for (path, versions) in &by_path {
+            for (j, &(_, i)) in versions.iter().enumerate() {
+                if !keep.contains(&i) || !ends(&records[i].1, path) {
+                    continue;
+                }
+                if let Some(&(_, c)) = versions[..j]
+                    .iter()
+                    .rev()
+                    .find(|&&(_, c)| !ends(&records[c].1, path))
+                {
+                    keep.insert(c);
+                }
+            }
+        }
+        if keep.len() == before {
+            return keep;
+        }
+    }
 }
 
 /// Writes `kept` into segments `first`, `first + 1`, … rolled at `roll_at`.
@@ -195,9 +246,10 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// [`Error::ReadOnly`] without the writer lock; I/O and index errors.
+    /// [`Error::ReadOnly`] without the writer lock; [`Error::Config`] when
+    /// `config.toml` can't be read; I/O and index errors.
     pub fn compact(&mut self, now: i64, dry_run: bool) -> Result<Report> {
-        let policy = Policy::from_config(&self.dir);
+        let policy = Policy::load(&self.dir)?;
         self.compact_with(now, &policy, dry_run, None)
     }
 
@@ -356,6 +408,23 @@ mod tests {
         assert!(!keep.contains(&2) && keep.contains(&3));
         assert!(!keep.contains(&4) && keep.contains(&5));
         assert!(keep.contains(&7));
+    }
+
+    #[test]
+    fn a_kept_tombstone_keeps_the_content_it_ended() {
+        let now = 400 * DAY;
+        let t = now - 30 * HOUR;
+        let t = t - t.rem_euclid(HOUR); // the start of an hour bucket
+        let recs = vec![
+            rec(Kind::Write, t + 60, "a", ""),       // 0 draft
+            rec(Kind::Write, t + 20 * 60, "a", ""),  // 1 final
+            rec(Kind::Delete, t + 40 * 60, "a", ""), // 2
+            rec(Kind::Write, t + 61, "b", ""),       // 3
+            rec(Kind::Rename, t + 62, "c", "b"),     // 4 b -> c
+            rec(Kind::Delete, t + 63, "c", ""),      // 5
+        ];
+        let keep = plan(&recs, now, &Policy::default());
+        assert_eq!(keep, BTreeSet::from([1, 2, 3, 4, 5]));
     }
 
     #[test]
