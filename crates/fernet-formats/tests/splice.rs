@@ -674,3 +674,89 @@ fn review_regressions() {
         "# A\nhello"
     );
 }
+
+/// The value at `p` after parsing `src` with `d`.
+fn value_at(d: &dyn Driver, src: &str, p: &str) -> Option<(NodeKind, String)> {
+    let t = d.parse(src.as_bytes()).unwrap();
+    t.get(&ptr(p)).map(|id| {
+        let n = t.node(id);
+        (n.kind, n.text.clone())
+    })
+}
+
+/// Edge cases in the TOML driver's inserts and removes.
+#[test]
+fn toml_edge_case_regressions() {
+    // Mixed line endings: untouched lines keep theirs, even inside a
+    // multi-line string, and the string's value doesn't change.
+    let src = "a = 1\r\ns = \"\"\"x\ny\"\"\"\n";
+    let out = ins(&Toml, src, "", "n", text("2")).unwrap();
+    assert_eq!(out, "a = 1\r\ns = \"\"\"x\ny\"\"\"\nn = 2\n");
+    assert_eq!(value_at(&Toml, &out, "s").unwrap().1, "x\ny");
+    let src = "a = 1\r\nb = 2\r\ns = \"\"\"x\ny\"\"\"\r\n";
+    let out = ins(&Toml, src, "", "n", text("2")).unwrap();
+    assert_eq!(out, format!("{src}n = 2\r\n"));
+    assert_eq!(
+        rm(&Toml, src, "b").unwrap(),
+        "a = 1\r\ns = \"\"\"x\ny\"\"\"\r\n"
+    );
+    // New text is a TOML value only if it's exactly one; else a string.
+    let src = "a = 1\n";
+    for (t, kind, want) in [
+        ("1\nc = 2", ScalarType::String, "1\nc = 2"),
+        ("5 # five", ScalarType::String, "5 # five"),
+        ("5", ScalarType::Integer, "5"),
+        ("5\n", ScalarType::Integer, "5"),
+        (" 5", ScalarType::String, " 5"),
+        ("1979-05-27", ScalarType::Datetime, "1979-05-27"),
+    ] {
+        let out = ins(&Toml, src, "", "b", text(t)).unwrap();
+        assert_eq!(
+            value_at(&Toml, &out, "b"),
+            Some((NodeKind::Scalar(kind), want.to_owned())),
+            "{t:?} -> {out:?}"
+        );
+        assert!(value_at(&Toml, &out, "c").is_none(), "{t:?}");
+        assert!(out.starts_with(src));
+    }
+    // Duplicate lines aren't a reorder.
+    let src = "[server]\nenabled = true\n[client]\nport = 1\n";
+    assert_eq!(
+        ins(&Toml, src, "client", "enabled", text("true")).unwrap(),
+        format!("{src}enabled = true\n")
+    );
+    let src = "[[p]]\nn = 1\n[[p]]\nn = 2\n";
+    assert_eq!(
+        ins(&Toml, src, "p", "2", NewValue::EmptyObject).unwrap(),
+        format!("{src}\n[[p]]\n")
+    );
+    assert_eq!(rm(&Toml, src, "p/0").unwrap(), "[[p]]\nn = 2\n");
+    assert_eq!(rm(&Toml, src, "p/1").unwrap(), "[[p]]\nn = 1\n");
+    // ... but real reorders are still refused.
+    assert!(ins(&Toml, "a.b = 1\nc = 2\na.d = 3\n", "", "e", text("4")).is_err());
+    // Arrays with per-element comments can't keep them on the right element.
+    let src = "arr = [\n  1, # one\n  2, # two\n  3, # three\n]\n";
+    assert!(matches!(
+        rm(&Toml, src, "arr/1"),
+        Err(DriverError::Unsupported(_))
+    ));
+    assert!(matches!(
+        ins(&Toml, src, "arr", "3", text("4")),
+        Err(DriverError::Unsupported(_))
+    ));
+    assert!(matches!(
+        rm(&Toml, src, "arr/9"),
+        Err(DriverError::NotFound)
+    ));
+    // Without comments they still work.
+    assert_eq!(
+        rm(&Toml, "arr = [\n  1,\n  2,\n  3,\n]\n", "arr/1").unwrap(),
+        "arr = [\n  1,\n  3,\n]\n"
+    );
+    // The only table of an array of tables: refused, not the key deleted.
+    assert!(matches!(
+        rm(&Toml, "x = 1\n[[p]]\nn = 1\n", "p/0"),
+        Err(DriverError::Unsupported(_))
+    ));
+    assert_eq!(rm(&Toml, "x = 1\n[[p]]\nn = 1\n", "p").unwrap(), "x = 1\n");
+}

@@ -260,6 +260,24 @@ pub(crate) fn check_scalar(
     }
 }
 
+/// True if two trees hold the same keys, kinds and values, whatever their
+/// spans.
+pub(crate) fn same_content(a: &Tree, b: &Tree) -> bool {
+    fn eq(ta: &Tree, ia: NodeId, tb: &Tree, ib: NodeId) -> bool {
+        let (na, nb) = (ta.node(ia), tb.node(ib));
+        na.kind == nb.kind
+            && na.text == nb.text
+            && na.raw == nb.raw
+            && na.children.len() == nb.children.len()
+            && na
+                .children
+                .iter()
+                .zip(&nb.children)
+                .all(|((ka, ca), (kb, cb))| ka == kb && eq(ta, *ca, tb, *cb))
+    }
+    eq(a, a.root, b, b.root)
+}
+
 /// Lowercase name of a scalar type, for messages.
 #[must_use]
 pub fn type_name(ty: ScalarType) -> &'static str {
