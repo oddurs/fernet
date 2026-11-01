@@ -760,3 +760,62 @@ fn toml_edge_case_regressions() {
     ));
     assert_eq!(rm(&Toml, "x = 1\n[[p]]\nn = 1\n", "p").unwrap(), "x = 1\n");
 }
+
+/// Edge cases in the Markdown driver.
+#[test]
+fn markdown_edge_case_regressions() {
+    use fernet_fs_formats::Markdown;
+    let keys = |src: &str| {
+        let t = Markdown.parse(src.as_bytes()).unwrap();
+        t.node(t.root)
+            .children
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect::<Vec<_>>()
+    };
+    // Emptying a body that holds a link definition a heading uses is refused.
+    let src = "# A\n[foo]: /url\n\n# [foo]\ntext\n";
+    assert_eq!(keys(src), ["body", "A", "foo"]);
+    assert!(matches!(
+        rm(&Markdown, src, "A/body"),
+        Err(DriverError::InvalidValue(_))
+    ));
+    // Emptying an ordinary body still works.
+    assert_eq!(
+        rm(&Markdown, "# A\nx\n\n# B\n", "A/body").unwrap(),
+        "# A\n\n# B\n"
+    );
+    // An empty body written back as read is byte-identical.
+    for (src, p) in [
+        ("# A\n# B\n", "A/body"),
+        ("# A\n# B\n", "body"),
+        ("# A", "A/body"),
+        ("# A\n", "A/body"),
+        ("# A\n\n# B\n", "A/body"),
+    ] {
+        let (_, read) = value_at(&Markdown, src, p).unwrap();
+        assert_eq!(
+            set(&Markdown, src, p, &format!("{read}\n")).unwrap(),
+            src,
+            "{src:?} {p}"
+        );
+        assert_eq!(set(&Markdown, src, p, &read).unwrap(), src, "{src:?} {p}");
+    }
+    assert_eq!(
+        set(&Markdown, "# A\n# B\n", "A/body", "x").unwrap(),
+        "# A\nx\n# B\n"
+    );
+    // YAML front matter is part of the root body, not a heading.
+    let src = "---\ntitle: Hello\n---\n# Intro\nhi\n";
+    assert_eq!(keys(src), ["body", "Intro"]);
+    assert_eq!(
+        value_at(&Markdown, src, "body").unwrap().1,
+        "---\ntitle: Hello\n---"
+    );
+    assert_eq!(
+        set(&Markdown, src, "body", "---\ntitle: Bye\n---").unwrap(),
+        "---\ntitle: Bye\n---\n# Intro\nhi\n"
+    );
+    // A multi-line setext heading keeps its line break as a space.
+    assert_eq!(keys("Foo\nbar\n===\n"), ["body", "Foo bar"]);
+}
