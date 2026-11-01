@@ -751,3 +751,64 @@ segment is missing, the open (and `Store::records`) starts over from a fresh
 now decompresses and hashes the existing file, and rewrites it atomically if it
 doesn't match, so a capture of the same content repairs the damage instead of
 pointing new records at it.
+
+## 74. Captures never follow symlinks
+
+**Context.** `fernet init` skipped symlinks, but `fernet watch` and the
+mount's capture checked `is_dir()`, which follows links, and then walked the
+target: a link to a directory outside the root was captured, and `self -> .`
+captured `self/.fernet/…`, the store's own files.
+
+**Decision.** Every capture path uses `symlink_metadata`. A symlink, even to
+a directory, is a non-file: if it had history, that history ends. Watchers are
+built with `notify`'s `follow_symlinks(false)`. A path whose parent directory
+is reached through a symlink (its canonical location differs from its
+spelling) is treated as not there: never captured, and a tombstone if it had
+history (a directory replaced by a link to another holding the same names ends
+the old files). Nothing is captured whose real location is outside the root or
+inside the store. `Ignore::ignored` matches `.fernet` with `is_store_name`
+(case-insensitive on macOS, as decision 57 intended).
+
+## 75. Unreadable paths are skipped, not fatal
+
+**Context.** One unreadable file (mode 000) aborted `fernet init`, leaving a
+store that a second `init` refused as existing, and stopped `fernet watch` from
+starting.
+
+**Decision.** `Fernet::capture_tree` returns a `TreeCapture`: the count and the
+paths it couldn't read, with the reason. I/O errors on single files or
+directories are skipped there; store errors still fail. `snapshot_tree` keeps
+its signature and logs skips. The CLI prints `fernet: skipped <path>: <why>` on
+stderr for `init`, `watch`'s initial capture and directory events. A path that
+can't be inspected (permission denied) is never taken for a deletion: its
+history is left alone. A missing component or one that is now a file
+(`ENOTDIR`) is a deletion.
+
+## 76. Ignore rules: live captures match the walk
+
+**Context.** With `logs/` and `!logs/keep.txt`, the tree walk pruned `logs/`
+and never captured `keep.txt`, but live events used
+`matched_path_or_any_parents`, which lets the whitelist win, so `keep.txt` was
+captured once it changed.
+
+**Decision.** `Ignore::ignored` uses gitignore semantics, as the walk does: each
+ancestor directory is checked from the top down, and a path under an ignored
+directory is ignored whatever later patterns say. Then the path itself.
+
+## 77. Endings and roots, more cases
+
+**Decision.**
+- **A directory replaced by a file** ends everything recorded under it, live
+  or in a tree capture: capturing a regular file also tombstones live paths
+  below it. (A directory replaced by a non-file already did, decision 57.)
+- **Root discovery** looks for the nearest ancestor holding a store (a
+  `.fernet/FORMAT`), so a nested `.fernet` directory that is user data
+  (decision 18) no longer hides the real store above it. Only when no store is
+  found does the nearest plain `.fernet` directory set the root, as before.
+
+## 78. `fernet log` truncates to the second
+
+**Decision.** `fernet log` used to round timestamps to the nearest second,
+so a version at `…:15.6` was shown as `…:16`, a second after it happened, and
+disagreed with version names, which truncate. Log stamps now truncate: the
+display never shows a time later than the version's instant.

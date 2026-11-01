@@ -396,3 +396,150 @@ fn moves_replacements_and_symlinks() {
         "{\"a\": 2}\n"
     );
 }
+
+/// Live captures agree with the tree walk: under an ignored directory, a
+/// `!pattern` can't re-include a file (gitignore semantics).
+#[test]
+fn ignore_rules_agree_between_walk_and_live_captures() {
+    let w = World::new();
+    fs::write(w.root.join(".fernetignore"), "logs/\n!logs/keep.txt\n").unwrap();
+    fs::create_dir(w.root.join("logs")).unwrap();
+    fs::write(w.root.join("logs/keep.txt"), "k").unwrap();
+    fs::write(w.root.join("logs/other.txt"), "o").unwrap();
+    // Reopen, so the new .fernetignore is loaded.
+    drop(w.f);
+    let f = Fernet::open_with(
+        &w.root,
+        Options {
+            mode: Mode::Write,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert!(f.ignore().ignored(&w.root.join("logs/keep.txt"), false));
+    assert!(f.ignore().ignored(&w.root.join("logs"), true));
+    assert!(!f.ignore().ignored(&w.root.join("keep.txt"), false));
+    assert_eq!(f.snapshot_tree(&w.root).unwrap(), 1); // .fernetignore
+    assert_eq!(f.snapshot(&w.root.join("logs/keep.txt")).unwrap(), None);
+    assert!(
+        f.store()
+            .unwrap()
+            .versions("logs/keep.txt")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// `config.toml` ignore patterns are real TOML: single quotes, comments and
+/// multi-line arrays all work.
+#[test]
+fn config_ignore_patterns_are_toml() {
+    let w = World::new();
+    let config = w.root.join(".fernet/config.toml");
+    let text = fs::read_to_string(&config).unwrap().replace(
+        "patterns = []",
+        "patterns = [\n  '*.log',  # logs\n  \"cache/\",\n]",
+    );
+    fs::write(&config, text).unwrap();
+    let ignore = fernet_fs_core::Ignore::load(&w.root);
+    assert!(ignore.ignored(&w.root.join("x.log"), false));
+    assert!(ignore.ignored(&w.root.join("cache/a"), false));
+    assert!(!ignore.ignored(&w.root.join("x.txt"), false));
+}
+
+/// Captures never follow symlinks to directories: nothing outside the root
+/// and nothing in the store is captured through one, and a directory
+/// replaced by a link ends the history under it.
+#[test]
+fn captures_never_follow_directory_symlinks() {
+    let w = World::new();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("secret.txt"), "s").unwrap();
+    fs::write(w.root.join("real.txt"), "r").unwrap();
+    std::os::unix::fs::symlink(outside.path(), w.root.join("out")).unwrap();
+    std::os::unix::fs::symlink(".", w.root.join("self")).unwrap();
+    w.at("2026-10-01T12:00:00Z");
+    assert_eq!(w.f.snapshot_tree(&w.root).unwrap(), 1);
+    assert_eq!(w.f.snapshot_tree(&w.root.join("out")).unwrap(), 0);
+    assert_eq!(w.f.snapshot_tree(&w.root.join("self")).unwrap(), 0);
+    for p in ["out/secret.txt", "self/real.txt", "self/.fernet/MANIFEST"] {
+        assert_eq!(w.f.snapshot(&w.root.join(p)).unwrap(), None, "{p}");
+    }
+    {
+        let store = w.f.store().unwrap();
+        assert_eq!(store.paths("").unwrap(), ["real.txt"]);
+    }
+
+    // A directory replaced by a symlink to one holding the same names.
+    w.save("2026-10-02T12:00:00Z", "d/secret.txt", "mine");
+    w.at("2026-10-03T12:00:00Z");
+    fs::remove_dir_all(w.root.join("d")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), w.root.join("d")).unwrap();
+    w.f.snapshot(&w.root.join("d")).unwrap();
+    w.at("2026-10-04T12:00:00Z");
+    assert!(w.read("d@now").is_err());
+    assert_eq!(w.read("d@2026-10-02T13:00Z/secret.txt").unwrap(), "mine");
+}
+
+/// A directory replaced by a file ends the history under it, live and in a
+/// tree capture.
+#[test]
+fn a_directory_replaced_by_a_file_ends_its_contents() {
+    let w = World::new();
+    w.save("2026-10-01T12:00:00Z", "d/x", "x");
+    w.save("2026-10-01T12:00:00Z", "d/y", "y");
+    w.at("2026-10-02T12:00:00Z");
+    fs::remove_dir_all(w.root.join("d")).unwrap();
+    fs::write(w.root.join("d"), "file").unwrap();
+    w.f.snapshot(&w.root.join("d")).unwrap();
+    w.at("2026-10-03T12:00:00Z");
+    assert_eq!(w.read("d@now").unwrap(), "file");
+    assert_eq!(w.read("d@2026-10-01T13:00Z/x").unwrap(), "x");
+    let store = w.f.store().unwrap();
+    for p in ["d/x", "d/y"] {
+        let v = store.version_at(p, i64::MAX).unwrap().unwrap();
+        assert!(v.hash.is_none(), "{p} should be tombstoned");
+    }
+}
+
+fn readable_by_us(path: &Path) -> bool {
+    fs::read(path).is_ok()
+}
+
+/// One unreadable file or directory doesn't stop a tree capture: it's
+/// skipped and reported, its history left alone, and the rest captured.
+#[test]
+fn unreadable_paths_are_skipped() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = World::new();
+    w.save("2026-10-01T12:00:00Z", "locked/old.txt", "old");
+    fs::write(w.root.join("a.txt"), "a").unwrap();
+    fs::write(w.root.join("secret.txt"), "s").unwrap();
+    fs::write(w.root.join("z.txt"), "z").unwrap();
+    fs::set_permissions(w.root.join("secret.txt"), fs::Permissions::from_mode(0o000)).unwrap();
+    fs::set_permissions(w.root.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+    let unreadable = !readable_by_us(&w.root.join("secret.txt"));
+    w.at("2026-10-02T12:00:00Z");
+    let report = w.f.capture_tree(&w.root);
+    fs::set_permissions(w.root.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+    let report = report.unwrap();
+    if !unreadable {
+        return; // Running as root: permissions don't apply.
+    }
+    let skipped: Vec<&Path> = report.skipped.iter().map(|(p, _)| p.as_path()).collect();
+    assert!(
+        skipped.contains(&w.root.join("secret.txt").as_path()),
+        "{skipped:?}"
+    );
+    assert!(
+        skipped.contains(&w.root.join("locked").as_path()),
+        "{skipped:?}"
+    );
+    assert_eq!(report.captured, 2); // a.txt, z.txt
+    let store = w.f.store().unwrap();
+    let v = store
+        .version_at("locked/old.txt", i64::MAX)
+        .unwrap()
+        .unwrap();
+    assert!(v.hash.is_some(), "an unreadable directory isn't a deletion");
+}
