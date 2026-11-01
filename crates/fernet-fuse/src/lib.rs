@@ -48,6 +48,11 @@ const ESTALE: i32 = 116;
 const ESTALE: i32 = 70;
 
 #[cfg(target_os = "linux")]
+const O_APPEND: i32 = 0o2000;
+#[cfg(not(target_os = "linux"))]
+const O_APPEND: i32 = 0x0008;
+
+#[cfg(target_os = "linux")]
 const O_NONBLOCK: i32 = 0o4000;
 #[cfg(not(target_os = "linux"))]
 const O_NONBLOCK: i32 = 0x0004;
@@ -75,6 +80,9 @@ pub struct FernetFs {
     handles: Mutex<HashMap<u64, Handle>>,
     /// Sizes of keys created but not yet written (`create` then `write`).
     pending: Mutex<HashMap<u64, usize>>,
+    /// Held while a new key is inserted and while `#` names are unlinked,
+    /// so an unlink can't fall between a release's check and its insert.
+    new_keys: Mutex<()>,
     next_fh: AtomicU64,
     uid: u32,
     gid: u32,
@@ -95,6 +103,9 @@ enum Handle {
         written: bool,
         ino: u64,
         passthrough: bool,
+        /// Opened with `O_APPEND`: writes go to the file's real end, not the
+        /// offset the kernel computed from a possibly stale size.
+        append: bool,
     },
     /// Rendered bytes of a read-only virtual file.
     Bytes(Arc<Vec<u8>>),
@@ -108,6 +119,10 @@ enum Handle {
         buf: Vec<u8>,
         dirty: bool,
         written: bool,
+        /// The value as this handle last saw it. If another value sits at
+        /// the pointer by apply time (a sibling array element was removed,
+        /// someone else wrote it), the write is refused, not misplaced.
+        base: Option<Vec<u8>>,
     },
     /// A new key, inserted once written (or on release if never written).
     NewKey {
@@ -118,6 +133,8 @@ enum Handle {
         ino: u64,
         inserted: bool,
         written: bool,
+        /// Unlinked before it was inserted: never insert it.
+        orphan: bool,
     },
     /// A directory listing, fixed at opendir.
     Dir(Vec<(u64, FileType, OsString)>),
@@ -346,6 +363,7 @@ impl FernetFs {
             inodes: Mutex::new(inodes),
             handles: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            new_keys: Mutex::new(()),
             next_fh: AtomicU64::new(1),
             uid,
             gid,
@@ -623,20 +641,45 @@ impl FernetFs {
     /// only after a write; on release whatever is pending. Returns an errno to
     /// report from `flush`/`close` when the write is refused.
     fn apply(&self, fh: u64, releasing: bool) -> Result<(), Errno> {
+        let new_key = matches!(
+            self.handles
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&fh),
+            Some(Handle::NewKey { .. })
+        );
+        let _guard = new_key.then(|| self.new_keys.lock().unwrap_or_else(PoisonError::into_inner));
         let mut handles = self.handles.lock().unwrap_or_else(PoisonError::into_inner);
         match handles.get_mut(&fh) {
+            Some(Handle::NewKey { orphan: true, .. }) => Ok(()),
             Some(Handle::Value {
                 ino,
                 buf,
                 dirty,
                 written,
+                base,
             }) if *dirty && (*written || releasing) => {
                 let text = String::from_utf8(buf.clone()).map_err(|_| Errno::EINVAL)?;
-                let ino = *ino;
+                let (ino, seen) = (*ino, base.clone());
                 *dirty = false;
                 drop(handles);
                 let node = self.current(ino).ok_or(Errno::ENOENT)?;
-                self.fernet.write_value(&node, &text).map_err(|e| errno(&e))
+                if seen.is_some() && self.fernet.read(&node).ok() != seen {
+                    return Err(Errno::from_i32(ESTALE));
+                }
+                self.fernet
+                    .write_value(&node, &text)
+                    .map_err(|e| errno(&e))?;
+                let now = self.fernet.read(&node).ok();
+                if let Some(Handle::Value { base, .. }) = self
+                    .handles
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get_mut(&fh)
+                {
+                    *base = now;
+                }
+                Ok(())
             }
             Some(Handle::NewKey {
                 parent,
@@ -645,6 +688,7 @@ impl FernetFs {
                 ino,
                 inserted,
                 written,
+                ..
             }) if !*inserted && (*written || releasing) => {
                 let text = String::from_utf8(buf.clone()).map_err(|_| Errno::EINVAL)?;
                 let (parent, key, ino) = (*parent, key.clone(), *ino);
@@ -738,6 +782,103 @@ impl FernetFs {
     }
 }
 
+/// Whether `name` carries a time lens whose meaning moves: anything but an
+/// absolute instant.
+fn moving_spec(name: &OsStr) -> bool {
+    use fernet_fs_path::TimeSpec;
+    name.to_str()
+        .and_then(|n| fernet_fs_path::Component::parse(n).when)
+        .is_some_and(|w| !matches!(w, TimeSpec::Absolute(_) | TimeSpec::Stamp(_)))
+}
+
+impl FernetFs {
+    /// Removing or renaming a name that isn't on disk but resolves through a
+    /// lens (`a@first`, `a.json#`): those are read-only views.
+    fn lens_refusal(&self, dir: &Resolved, path: &Path, name: &OsStr) -> Option<Errno> {
+        if fs::symlink_metadata(path).is_ok() {
+            return None;
+        }
+        let c = fernet_fs_path::Component::parse(name.to_str()?);
+        if c.when.is_none() && !c.open {
+            return None;
+        }
+        match self.fernet.lookup(dir, name) {
+            Ok(Resolved::Missing) | Err(_) => None,
+            Ok(_) => Some(Errno::EROFS),
+        }
+    }
+
+    /// The inode of a key created through this mount under `parent` and not
+    /// inserted yet.
+    fn pending_key(&self, parent: u64, name: &OsStr) -> Option<u64> {
+        let key = name.to_str().and_then(fernet_fs_path::decode_token)?;
+        let handles = self.handles.lock().unwrap_or_else(PoisonError::into_inner);
+        handles.values().find_map(|h| match h {
+            Handle::NewKey {
+                parent: p,
+                key: k,
+                ino,
+                inserted: false,
+                orphan: false,
+                ..
+            } if *p == parent && *k == key => Some(*ino),
+            _ => None,
+        })
+    }
+
+    /// Unlinks a key created through this mount but not inserted yet: it is
+    /// dropped, and never inserted on release.
+    fn unlink_pending(&self, parent: u64, name: &OsStr) -> bool {
+        let Some(key) = name.to_str().and_then(fernet_fs_path::decode_token) else {
+            return false;
+        };
+        let mut found = Vec::new();
+        let mut handles = self.handles.lock().unwrap_or_else(PoisonError::into_inner);
+        for h in handles.values_mut() {
+            if let Handle::NewKey {
+                parent: p,
+                key: k,
+                ino,
+                inserted: false,
+                orphan,
+                ..
+            } = h
+                && *p == parent
+                && *k == key
+                && !*orphan
+            {
+                *orphan = true;
+                found.push(*ino);
+            }
+        }
+        drop(handles);
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        for ino in &found {
+            pending.remove(ino);
+        }
+        !found.is_empty()
+    }
+
+    /// Whether the container at `r` has anything in it. A Markdown section
+    /// always lists its `body`; an empty body doesn't count.
+    fn has_children(&self, r: &Resolved) -> Result<bool, Errno> {
+        let markdown = matches!(r, Resolved::Inside { source, .. }
+            if source.path().extension().and_then(OsStr::to_str)
+                .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown")));
+        let entries = self.fernet.list(r).map_err(|e| errno(&e))?;
+        let empty_body = |name: &OsStr| {
+            markdown
+                && name == "body"
+                && self
+                    .fernet
+                    .lookup(r, name)
+                    .and_then(|b| self.fernet.read(&b))
+                    .is_ok_and(|b| b.iter().all(u8::is_ascii_whitespace))
+        };
+        Ok(entries.iter().any(|e| !empty_body(&e.name)))
+    }
+}
+
 impl Filesystem for FernetFs {
     fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> std::io::Result<()> {
         // Pass O_TRUNC to open instead of a separate truncate, so `echo x >
@@ -752,6 +893,9 @@ impl Filesystem for FernetFs {
         // the kernel drops it when a file's mtime or size changes, including
         // changes made outside the mount.
         let _ = config.add_capabilities(fuser::InitFlags::FUSE_AUTO_INVAL_DATA);
+        // Values bypass the page cache (FOPEN_DIRECT_IO); allow mmap of them
+        // anyway (Linux 6.6+).
+        let _ = config.add_capabilities(fuser::InitFlags::FUSE_DIRECT_IO_ALLOW_MMAP);
         // Passthrough when the kernel offers it; the page cache otherwise.
         if std::env::var_os("FERNET_NO_PASSTHROUGH").is_none()
             && config
@@ -776,7 +920,32 @@ impl Filesystem for FernetFs {
         };
         tracing::trace!(parent = parent.0, ?name, ?dir, "lookup");
         match self.fernet.lookup(&dir, name) {
-            Ok(Resolved::Missing) => reply.error(Errno::ENOENT),
+            // A key created here and not inserted yet is still there.
+            Ok(Resolved::Missing) => match self.pending_key(parent.0, name) {
+                Some(ino) => match self.node(INodeNo(ino)) {
+                    Some((r, _)) => match self.attr(ino, &r) {
+                        Ok((attr, ttl)) => {
+                            self.add_ref(ino);
+                            reply.entry(&ttl, &attr, Generation(0));
+                        }
+                        Err(e) => reply.error(e),
+                    },
+                    None => reply.error(Errno::ENOENT),
+                },
+                None => reply.error(Errno::ENOENT),
+            },
+            Ok(r) if moving_spec(name) => {
+                // `@now`, `@-1h`, `@~1` name a different version as time
+                // passes or files change: the kernel mustn't keep the entry.
+                let ino = self.register(r.clone(), parent.0);
+                match self.attr(ino, &r) {
+                    Ok((attr, _)) => {
+                        self.add_ref(ino);
+                        reply.entry(&TTL_PRESENT, &attr, Generation(0));
+                    }
+                    Err(e) => reply.error(e),
+                }
+            }
             Ok(r) => self.entry_reply(&r, parent.0, reply),
             Err(e) => reply.error(errno(&e)),
         }
@@ -858,7 +1027,15 @@ impl Filesystem for FernetFs {
         let res: Result<(), Errno> = (|| {
             match &r {
                 Resolved::RealFile { path } | Resolved::RealDir { path } => {
-                    let handle = fh.and_then(|fh| self.handle_file(fh.0));
+                    // fchmod and futimens arrive without a handle: when the
+                    // path now names another file, use one of this inode's.
+                    let replaced = || {
+                        let now = fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino()));
+                        self.ident(ino.0).is_some_and(|i| Some(i) != now)
+                    };
+                    let handle = fh
+                        .and_then(|fh| self.handle_file(fh.0))
+                        .or_else(|| replaced().then(|| self.any_open_file(ino.0)).flatten());
                     let meta = match &handle {
                         Some(f) => f.metadata(),
                         None => fs::symlink_metadata(path),
@@ -873,8 +1050,14 @@ impl Filesystem for FernetFs {
                         if meta.file_type().is_symlink() {
                             return Err(Errno::EOPNOTSUPP);
                         }
-                        fs::set_permissions(path, fs::Permissions::from_mode(m & 0o7777))
-                            .map_err(Errno::from)?;
+                        // Through the handle when there is one: the path may
+                        // name a different file by now.
+                        let perms = fs::Permissions::from_mode(m & 0o7777);
+                        match &handle {
+                            Some(f) => f.set_permissions(perms),
+                            None => fs::set_permissions(path, perms),
+                        }
+                        .map_err(Errno::from)?;
                     }
                     if let Some(len) = size {
                         match &handle {
@@ -899,13 +1082,16 @@ impl Filesystem for FernetFs {
                                 nix::sys::time::TimeSpec::from_duration(d)
                             }
                         };
-                        nix::sys::stat::utimensat(
-                            nix::fcntl::AT_FDCWD,
-                            path.as_path(),
-                            &t(atime),
-                            &t(mtime),
-                            nix::sys::stat::UtimensatFlags::NoFollowSymlink,
-                        )
+                        match &handle {
+                            Some(f) => nix::sys::stat::futimens(f, &t(atime), &t(mtime)),
+                            None => nix::sys::stat::utimensat(
+                                nix::fcntl::AT_FDCWD,
+                                path.as_path(),
+                                &t(atime),
+                                &t(mtime),
+                                nix::sys::stat::UtimensatFlags::NoFollowSymlink,
+                            ),
+                        }
                         .map_err(|e| Errno::from_i32(e as i32))?;
                     }
                 }
@@ -1043,16 +1229,26 @@ impl Filesystem for FernetFs {
         let res = match &dir {
             Resolved::RealDir { path } => {
                 let p = path.join(name);
+                if let Some(e) = self.lens_refusal(&dir, &p, name) {
+                    return reply.error(e);
+                }
                 fs::remove_file(&p).map_err(Errno::from).map(|()| {
                     self.forget_path(&p);
                     self.touch(&p);
                 })
             }
-            Resolved::Inside { .. } => match self.fernet.lookup(&dir, name) {
-                Ok(Resolved::Missing) => Err(Errno::ENOENT),
-                Ok(child) => self.fernet.remove(&child).map_err(|e| errno(&e)),
-                Err(e) => Err(errno(&e)),
-            },
+            Resolved::Inside { .. } => {
+                let _guard = self.new_keys.lock().unwrap_or_else(PoisonError::into_inner);
+                if self.unlink_pending(parent.0, name) {
+                    Ok(())
+                } else {
+                    match self.fernet.lookup(&dir, name) {
+                        Ok(Resolved::Missing) => Err(Errno::ENOENT),
+                        Ok(child) => self.fernet.remove(&child).map_err(|e| errno(&e)),
+                        Err(e) => Err(errno(&e)),
+                    }
+                }
+            }
             _ => Err(Errno::ENOTDIR),
         };
         match res {
@@ -1069,13 +1265,25 @@ impl Filesystem for FernetFs {
         let res = match &dir {
             Resolved::RealDir { path } => {
                 let p = path.join(name);
+                if let Some(e) = self.lens_refusal(&dir, &p, name) {
+                    return reply.error(e);
+                }
                 fs::remove_dir(&p)
                     .map_err(Errno::from)
                     .map(|()| self.forget_path(&p))
             }
+            // Like any directory: only when empty.
             Resolved::Inside { .. } => match self.fernet.lookup(&dir, name) {
                 Ok(Resolved::Missing) => Err(Errno::ENOENT),
-                Ok(child) => self.fernet.remove(&child).map_err(|e| errno(&e)),
+                Ok(Resolved::Inside {
+                    node: NodeKind::Scalar(_),
+                    ..
+                }) => Err(Errno::ENOTDIR),
+                Ok(child) => match self.has_children(&child) {
+                    Ok(true) => Err(Errno::ENOTEMPTY),
+                    Ok(false) => self.fernet.remove(&child).map_err(|e| errno(&e)),
+                    Err(e) => Err(e),
+                },
                 Err(e) => Err(errno(&e)),
             },
             _ => Err(Errno::ENOTDIR),
@@ -1130,6 +1338,12 @@ impl Filesystem for FernetFs {
             return reply.error(Errno::EXDEV);
         };
         let (from, to) = (a.join(name), b.join(newname));
+        if let Some(e) = self
+            .lens_refusal(&from_dir, &from, name)
+            .or_else(|| self.lens_refusal(&to_dir, &to, newname))
+        {
+            return reply.error(e);
+        }
         #[cfg(target_os = "linux")]
         {
             if flags.contains(RenameFlags::RENAME_EXCHANGE) {
@@ -1165,6 +1379,7 @@ impl Filesystem for FernetFs {
         tracing::trace!(ino = ino.0, ?r, "open");
         let write = flags.acc_mode() != OpenAccMode::O_RDONLY;
         let trunc = flags.0 & O_TRUNC != 0;
+        let append = write && flags.0 & O_APPEND != 0;
         if write && (!self.writable || r.is_past()) {
             return reply.error(Errno::EROFS);
         }
@@ -1173,6 +1388,7 @@ impl Filesystem for FernetFs {
                 let res = OpenOptions::new()
                     .read(flags.acc_mode() != OpenAccMode::O_WRONLY)
                     .write(write)
+                    .append(append)
                     .truncate(trunc && write)
                     .open(path);
                 let file = match res {
@@ -1194,6 +1410,7 @@ impl Filesystem for FernetFs {
                         written: write,
                         ino: ino.0,
                         passthrough: true,
+                        append,
                     });
                     return reply.opened_passthrough(fh, FopenFlags::empty(), &id);
                 }
@@ -1203,6 +1420,7 @@ impl Filesystem for FernetFs {
                     written: trunc && write,
                     ino: ino.0,
                     passthrough: false,
+                    append,
                 });
                 reply.opened(fh, FopenFlags::FOPEN_KEEP_CACHE);
             }
@@ -1218,11 +1436,17 @@ impl Filesystem for FernetFs {
                         Err(e) => return reply.error(errno(&e)),
                     }
                 };
+                let base = if trunc {
+                    self.fernet.read(&r).ok()
+                } else {
+                    Some(buf.clone())
+                };
                 let fh = self.new_handle(Handle::Value {
                     ino: ino.0,
                     buf,
                     dirty: trunc,
                     written: false,
+                    base,
                 });
                 // The size changes as the buffer does: bypass the page cache.
                 reply.opened(fh, FopenFlags::FOPEN_DIRECT_IO);
@@ -1259,9 +1483,11 @@ impl Filesystem for FernetFs {
         match &dir {
             Resolved::RealDir { path } => {
                 let p = path.join(name);
+                let append = flags & O_APPEND != 0;
                 let res = OpenOptions::new()
                     .read(true)
                     .write(true)
+                    .append(append)
                     .create(true)
                     .truncate(flags & O_TRUNC != 0)
                     .mode(mode & !umask & 0o7777)
@@ -1286,6 +1512,7 @@ impl Filesystem for FernetFs {
                         written: true,
                         ino,
                         passthrough: true,
+                        append,
                     });
                     return reply.created_passthrough(
                         &ttl,
@@ -1302,6 +1529,7 @@ impl Filesystem for FernetFs {
                     written: true,
                     ino,
                     passthrough: false,
+                    append,
                 });
                 reply.created(&ttl, &attr, Generation(0), fh, FopenFlags::FOPEN_KEEP_CACHE);
             }
@@ -1339,6 +1567,7 @@ impl Filesystem for FernetFs {
                     ino,
                     inserted: false,
                     written: false,
+                    orphan: false,
                 });
                 match self.attr(ino, &r) {
                     Ok((attr, ttl)) => {
@@ -1402,12 +1631,25 @@ impl Filesystem for FernetFs {
         let mut handles = self.handles.lock().unwrap_or_else(PoisonError::into_inner);
         let n = u32::try_from(data.len()).unwrap_or(u32::MAX);
         match handles.get_mut(&fh.0) {
-            Some(Handle::Real { file, written, .. }) => {
+            Some(Handle::Real {
+                file,
+                written,
+                append,
+                ..
+            }) => {
                 *written = true;
+                let append = *append;
                 // No lock held across the syscall: other workers carry on.
                 let f = file.try_clone();
                 drop(handles);
-                match f.and_then(|f| f.write_at(data, offset)) {
+                let res = f.and_then(|mut f| {
+                    if append {
+                        std::io::Write::write(&mut f, data)
+                    } else {
+                        f.write_at(data, offset)
+                    }
+                });
+                match res {
                     Ok(w) => reply.written(u32::try_from(w).unwrap_or(u32::MAX)),
                     Err(e) => reply.error(Errno::from(e)),
                 }

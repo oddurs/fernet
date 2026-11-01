@@ -266,10 +266,13 @@ fn store_failure(e: &fernet_fs_store::Error) -> Failure {
     }
 }
 
-/// The nearest ancestor of `cwd` (inclusive) holding a store, else `cwd`.
+/// The nearest ancestor of `cwd` (inclusive) holding a store; else the nearest
+/// holding a `.fernet` directory; else `cwd`. A store further up wins over a
+/// nearer `.fernet` directory that isn't one (no `FORMAT`): that's user data.
 fn find_root(cwd: &Path) -> PathBuf {
     cwd.ancestors()
-        .find(|d| d.join(STORE_DIR).is_dir())
+        .find(|d| fernet_fs_store::Store::exists(d))
+        .or_else(|| cwd.ancestors().find(|d| d.join(STORE_DIR).is_dir()))
         .unwrap_or(cwd)
         .to_owned()
 }
@@ -291,6 +294,10 @@ impl Ctx {
             },
         )
         .map_err(|e| failure(&e, root.as_os_str()))?;
+        // Completion must stay quiet; everything else says what it ignored.
+        if !matches!(cli.command, Command::Complete { .. }) {
+            warn_config(&fernet);
+        }
         // Resolve relative to the canonical cwd so it lines up with the root.
         let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
         Ok(Self { fernet, cwd })
@@ -435,9 +442,11 @@ fn init(cli: &Cli, dir: Option<&Path>, out: &mut impl Write) -> Result<(), Failu
         None => std::env::current_dir()?,
     };
     let f = Fernet::init(&dir, Options::default()).map_err(|e| failure(&e, dir.as_os_str()))?;
-    let n = f
-        .snapshot_tree(f.root())
+    let report = f
+        .capture_tree(f.root())
         .map_err(|e| failure(&e, dir.as_os_str()))?;
+    warn_skipped(&f, &report);
+    let n = report.captured;
     let files = if n == 1 { "file" } else { "files" };
     writeln!(
         out,
@@ -500,6 +509,7 @@ fn start_watch(cli: &Cli, dir: Option<&Path>) -> Result<u8, Failure> {
     if f.store().is_none() {
         return Err(Failure::new("there is no store here", exit::STORE).hint("fernet init"));
     }
+    warn_config(&f);
     warn_if_large(&f);
     watch(&f)?;
     Ok(0)
@@ -569,6 +579,7 @@ fn mount(dir: &Path, mountpoint: &Path, daemon: bool, read_only: bool) -> Result
     )
     .map_err(|e| failure(&e, dir.as_os_str()))?;
     let root = fernet.root().to_owned();
+    warn_config(&fernet);
     warn_if_large(&fernet);
     if mountpoint.starts_with(&root) {
         return Err(Failure::new(
@@ -628,11 +639,29 @@ fn write(ctx: &Ctx, arg: &OsStr, bytes: &[u8]) -> Result<(), Failure> {
     let Some(last) = names.pop() else {
         return Err(Failure::new("can't write the root", exit::USAGE));
     };
+    let read_only = || Error::ReadOnly {
+        path: arg.to_string_lossy().into_owned(),
+    };
     let parent = f
         .resolve_names(names.iter().map(OsString::as_os_str))
-        .map_err(|e| failure(&e, arg))?;
+        .map_err(|e| {
+            // Under a time lens that finds nothing, the write is still a
+            // write to the past.
+            let past = names.iter().any(|n| {
+                n.to_str()
+                    .is_some_and(|t| fernet_fs_path::Component::parse(t).when.is_some())
+            });
+            if past && matches!(e, Error::NotFound { .. }) {
+                failure(&read_only(), arg)
+            } else {
+                failure(&e, arg)
+            }
+        })?;
     let target = f.lookup(&parent, &last).map_err(|e| failure(&e, arg))?;
     let res = match (&target, &parent) {
+        // Anything under a time lens is read-only, found or not.
+        (_, p) if p.is_past() => Err(read_only()),
+        (r, _) if r.is_past() => Err(read_only()),
         (
             Resolved::Inside {
                 node: fernet_fs_core::NodeKind::Scalar(_),
@@ -651,18 +680,21 @@ fn write(ctx: &Ctx, arg: &OsStr, bytes: &[u8]) -> Result<(), Failure> {
             )
         }
         (Resolved::Missing, Resolved::RealDir { path }) => {
-            let path = path.join(&last);
-            std::fs::write(&path, bytes).map_err(|e| {
-                Failure::new(
-                    format!("{}: {e}", path.display()).to_lowercase(),
-                    exit::INTERNAL,
-                )
-            })?;
-            f.snapshot(&path).map(|_| ()).or(Ok(()))
+            // A name that parses with a lens names something that isn't
+            // there (`notes.txt@~9`, `notes.txt#`); it never becomes a file.
+            let lens = last
+                .to_str()
+                .map(fernet_fs_path::Component::parse)
+                .filter(|c| c.when.is_some() || c.open);
+            match lens {
+                Some(c) if c.when.is_some() => Err(read_only()),
+                Some(_) => Err(Error::Unsupported {
+                    path: arg.to_string_lossy().into_owned(),
+                    message: "# opens an existing structured file; there is none here".into(),
+                }),
+                None => f.create_file(path, &last, bytes),
+            }
         }
-        (r, _) if r.is_past() => Err(Error::ReadOnly {
-            path: arg.to_string_lossy().into_owned(),
-        }),
         (Resolved::Missing, _) => Err(Error::NotFound {
             parent: String::new(),
             name: arg.to_string_lossy().into_owned(),
@@ -692,6 +724,22 @@ fn compact(cli: &Cli, dry_run: bool, out: &mut impl Write) -> Result<(), Failure
         style::size(r.bytes_freed)
     )?;
     Ok(())
+}
+
+/// Warns on stderr about settings in `config.toml` that couldn't be read.
+fn warn_config(f: &Fernet) {
+    let Some(store) = f.store() else { return };
+    for p in store.config_problems() {
+        eprintln!("fernet: warning: {p}");
+    }
+}
+
+/// Warns on stderr about paths a tree capture couldn't read.
+fn warn_skipped(f: &Fernet, report: &fernet_fs_core::TreeCapture) {
+    for (path, why) in &report.skipped {
+        let shown = path.strip_prefix(f.root()).unwrap_or(path);
+        eprintln!("fernet: skipped {}: {why}", shown.display());
+    }
 }
 
 /// Warns on stderr when the store is past its configured size.
@@ -832,21 +880,27 @@ fn log(out: &mut impl Write, ctx: &Ctx, path: Option<&OsStr>, colour: bool) -> R
 fn watch(f: &Fernet) -> Result<(), Failure> {
     use notify::{RecursiveMode, Watcher};
     let root = f.root().to_owned();
-    let mut err = std::io::stderr().lock();
-    let n = f
-        .snapshot_tree(&root)
+    let report = f
+        .capture_tree(&root)
         .map_err(|e| failure(&e, root.as_os_str()))?;
+    warn_skipped(f, &report);
+    let n = report.captured;
+    let mut err = std::io::stderr().lock();
     writeln!(
         err,
         "watching {} ({n} captured at start); ctrl-c to stop",
         root.display()
     )?;
     let (tx, rx) = mpsc::channel();
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if let Ok(ev) = res {
-            let _ = tx.send(ev.paths);
-        }
-    })
+    // Never follow symlinks: they may lead outside the root, or into the store.
+    let mut watcher = notify::RecommendedWatcher::new(
+        move |res: notify::Result<notify::Event>| {
+            if let Ok(ev) = res {
+                let _ = tx.send(ev.paths);
+            }
+        },
+        notify::Config::default().with_follow_symlinks(false),
+    )
     .map_err(|e| Failure::new(format!("can't watch: {e}").to_lowercase(), exit::INTERNAL))?;
     watcher
         .watch(&root, RecursiveMode::Recursive)
@@ -861,12 +915,19 @@ fn watch(f: &Fernet) -> Result<(), Failure> {
         batch.sort();
         batch.dedup();
         for path in batch {
-            let is_dir = path.is_dir();
+            // A symlink to a directory is not a directory here.
+            let is_dir = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir());
             if f.ignore().ignored(&path, is_dir) {
                 continue;
             }
             let res = if is_dir {
-                f.snapshot_tree(&path).map(|n| n > 0)
+                f.capture_tree(&path).map(|r| {
+                    for (p, why) in &r.skipped {
+                        let shown = p.strip_prefix(&root).unwrap_or(p);
+                        let _ = writeln!(err, "fernet: skipped {}: {why}", shown.display());
+                    }
+                    r.captured > 0
+                })
             } else {
                 f.snapshot(&path).map(|v| v.is_some())
             };

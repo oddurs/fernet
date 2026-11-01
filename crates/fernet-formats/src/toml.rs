@@ -182,21 +182,33 @@ fn string_literal(old: &str, text: &str) -> String {
     format!("\"{}\"", escape_basic(text, false))
 }
 
-/// A TOML value for new text: whatever it parses as, else a string.
+/// A TOML value for new text: the value it is, if it's exactly one TOML
+/// value (no comment, nothing after it), else a string, as JSON does.
 fn new_value(text: &str) -> Value {
     let text = crate::strip_newline(text);
-    let parsed: Option<Value> = format!("v = {text}")
-        .parse::<DocumentMut>()
-        .ok()
-        .and_then(|d| d.get("v").and_then(Item::as_value).cloned());
-    match parsed {
-        Some(mut v) if !matches!(v, Value::String(_)) => {
+    match text.parse::<Value>() {
+        Ok(mut v) if !matches!(v, Value::String(_)) => {
             v.decor_mut().clear();
             v
         }
         _ => Value::from(text),
     }
 }
+
+/// True if an array's layout holds comments. `toml_edit` keeps a comment in
+/// the whitespace before the next element, so adding or removing an element
+/// would move it onto the wrong one.
+fn has_comments(a: &toml_edit::Array) -> bool {
+    let raw = |r: Option<&toml_edit::RawString>| {
+        r.and_then(|r| r.as_str()).is_some_and(|s| s.contains('#'))
+    };
+    raw(Some(a.trailing()))
+        || a.iter()
+            .any(|v| raw(v.decor().prefix()) || raw(v.decor().suffix()))
+}
+
+const COMMENTED_ARRAY: DriverError =
+    DriverError::Unsupported("this array has comments between its elements; edit it by hand");
 
 /// A mutable position in a `toml_edit` document.
 enum Slot<'a> {
@@ -235,7 +247,8 @@ fn step<'a>(slot: Slot<'a>, key: &str) -> Option<Slot<'a>> {
 }
 
 /// Parses `src` with `toml_edit`, applies `f` at `ptr`, and prints it back.
-/// `toml_edit` keeps every untouched item's formatting.
+/// `toml_edit` keeps every untouched item's formatting; [`merge_lines`] then
+/// keeps every untouched line's bytes, line ending included.
 fn edit_doc(
     src: &[u8],
     ptr: &[String],
@@ -250,36 +263,168 @@ fn edit_doc(
         slot = step(slot, key).ok_or(DriverError::NotFound)?;
     }
     f(slot)?;
-    let mut printed = doc.to_string();
-    // toml_edit prints LF; keep a CRLF file CRLF.
-    if s.contains("\r\n") {
-        printed = printed.replace("\r\n", "\n").replace('\n', "\r\n");
+    let printed = doc.to_string();
+    let merged = merge_lines(&s[start..], &printed)?;
+    // The merged text must mean exactly what toml_edit printed.
+    let same = match (
+        Toml.parse(merged.as_bytes()),
+        Toml.parse(printed.as_bytes()),
+    ) {
+        (Ok(a), Ok(b)) => crate::same_content(&a, &b),
+        _ => false,
+    };
+    if !same {
+        return Err(DriverError::Unsupported(
+            "this edit can't keep the file's layout; edit it by hand",
+        ));
     }
-    // toml_edit may regroup dotted keys when it prints. Insertions and
-    // removals are fine; moving untouched lines is not.
-    // Lines both versions share (edited lines drop out) must keep their order.
-    let old_lines: Vec<&str> = s[start..]
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .collect();
-    let new_lines: Vec<&str> = printed.lines().filter(|l| !l.trim().is_empty()).collect();
-    let kept_old: Vec<&str> = old_lines
+    let mut out = s.as_bytes()[..start].to_vec();
+    out.extend_from_slice(merged.as_bytes());
+    Ok(out)
+}
+
+/// One line: its text without the line ending, and the ending (`\n`,
+/// `\r\n` or nothing for a last line without one).
+fn split_lines(s: &str) -> Vec<(&str, &str)> {
+    s.split_inclusive('\n')
+        .map(|l| {
+            let body = l
+                .strip_suffix('\n')
+                .map_or(l, |b| b.strip_suffix('\r').unwrap_or(b));
+            (body, &l[body.len()..])
+        })
+        .collect()
+}
+
+/// The most cells [`lcs_pairs`] may use: the changed middle of a file is
+/// small for one insert or remove.
+const MAX_LCS_CELLS: usize = 1 << 22;
+
+/// Index pairs of a longest common subsequence of `old` and `new`.
+fn lcs_pairs(old: &[&str], new: &[&str]) -> Result<Vec<(usize, usize)>, DriverError> {
+    let width = new.len() + 1;
+    if (old.len() + 1).saturating_mul(width) > MAX_LCS_CELLS {
+        return Err(DriverError::Unsupported(
+            "this edit changes too much of the file at once; edit it by hand",
+        ));
+    }
+    // table[o * width + n]: LCS length of old[o..] and new[n..].
+    let mut table = vec![0u32; (old.len() + 1) * width];
+    for o in (0..old.len()).rev() {
+        for n in (0..new.len()).rev() {
+            table[o * width + n] = if old[o] == new[n] {
+                table[(o + 1) * width + n + 1] + 1
+            } else {
+                table[(o + 1) * width + n].max(table[o * width + n + 1])
+            };
+        }
+    }
+    let mut pairs = Vec::new();
+    let (mut o, mut n) = (0, 0);
+    while o < old.len() && n < new.len() {
+        if old[o] == new[n] {
+            pairs.push((o, n));
+            o += 1;
+            n += 1;
+        } else if table[(o + 1) * width + n] >= table[o * width + n + 1] {
+            o += 1;
+        } else {
+            n += 1;
+        }
+    }
+    Ok(pairs)
+}
+
+/// How many lines `a` and `b` share, counting duplicates (multiset
+/// intersection).
+fn shared_count(a: &[&str], b: &[&str]) -> usize {
+    let mut counts: std::collections::HashMap<&str, isize> = std::collections::HashMap::new();
+    for l in a {
+        *counts.entry(l).or_default() += 1;
+    }
+    let mut shared = 0;
+    for l in b {
+        if let Some(c) = counts.get_mut(l)
+            && *c > 0
+        {
+            *c -= 1;
+            shared += 1;
+        }
+    }
+    shared
+}
+
+/// Rebuilds `printed` (`toml_edit`'s output for the edited document) from
+/// `old`'s lines wherever they line up: every line the edit didn't touch keeps
+/// its exact bytes and line ending (`toml_edit` prints `\n`, and a file may
+/// mix endings, even inside multi-line strings). New lines get the file's
+/// usual ending.
+///
+/// Refuses if `toml_edit` moved untouched lines (it regroups dotted keys):
+/// every non-blank line both versions share must stay in order. Lines are
+/// compared as a multiset, so duplicate lines (`enabled = true` in two tables,
+/// `[[p]]` headers) count once per occurrence.
+fn merge_lines(old: &str, printed: &str) -> Result<String, DriverError> {
+    let old_lines = split_lines(old);
+    let new_lines = split_lines(printed);
+    // Trim the common head and tail; one edit changes a small middle.
+    let head = old_lines
         .iter()
-        .copied()
-        .filter(|l| new_lines.contains(l))
-        .collect();
-    let kept_new: Vec<&str> = new_lines
+        .zip(&new_lines)
+        .take_while(|(a, b)| a.0 == b.0)
+        .count();
+    let tail = old_lines[head..]
         .iter()
-        .copied()
-        .filter(|l| old_lines.contains(l))
+        .rev()
+        .zip(new_lines[head..].iter().rev())
+        .take_while(|(a, b)| a.0 == b.0)
+        .count();
+    let old_mid: Vec<&str> = old_lines[head..old_lines.len() - tail]
+        .iter()
+        .map(|l| l.0)
         .collect();
-    if kept_old != kept_new {
+    let new_mid: Vec<&str> = new_lines[head..new_lines.len() - tail]
+        .iter()
+        .map(|l| l.0)
+        .collect();
+    let nonblank = |l: &&str| !l.trim().is_empty();
+    let old_set: Vec<&str> = old_mid.iter().copied().filter(nonblank).collect();
+    let new_set: Vec<&str> = new_mid.iter().copied().filter(nonblank).collect();
+    if lcs_pairs(&old_set, &new_set)?.len() != shared_count(&old_set, &new_set) {
         return Err(DriverError::Unsupported(
             "this edit would reorder the file's keys; edit it by hand",
         ));
     }
-    let mut out = s.as_bytes()[..start].to_vec();
-    out.extend_from_slice(printed.as_bytes());
+    let crlf = old.matches("\r\n").count();
+    let usual = if crlf * 2 > old.matches('\n').count() {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    // Old line index for each new line that lines up with one.
+    let mut from_old: Vec<Option<usize>> = vec![None; new_lines.len()];
+    for (i, slot) in from_old.iter_mut().enumerate().take(head) {
+        *slot = Some(i);
+    }
+    for (i, j) in lcs_pairs(&old_mid, &new_mid)? {
+        from_old[head + j] = Some(head + i);
+    }
+    for k in 0..tail {
+        from_old[new_lines.len() - 1 - k] = Some(old_lines.len() - 1 - k);
+    }
+    let mut out = String::with_capacity(printed.len() + crlf);
+    for ((text, ending), old_index) in new_lines.iter().zip(from_old) {
+        out.push_str(text);
+        if ending.is_empty() {
+            continue;
+        }
+        let kept = old_index.map_or("", |i| old_lines[i].1);
+        out.push_str(match kept {
+            "" if *ending == "\r\n" => "\r\n",
+            "" => usual,
+            kept => kept,
+        });
+    }
     Ok(out)
 }
 
@@ -331,6 +476,9 @@ fn insert(slot: Slot<'_>, key: &str, value: &NewValue) -> Result<(), DriverError
         }
         Slot::Array(a) => {
             next_index(key, a.len())?;
+            if has_comments(a) {
+                return Err(COMMENTED_ARRAY);
+            }
             a.push(as_value());
         }
         Slot::Tables(a) => {
@@ -352,6 +500,7 @@ fn remove(slot: Slot<'_>, key: &str) -> Result<(), DriverError> {
         Slot::Table(t) => t.remove(key).is_some(),
         Slot::Inline(t) => t.remove(key).is_some(),
         Slot::Array(a) => match key.parse::<usize>() {
+            Ok(i) if i < a.len() && has_comments(a) => return Err(COMMENTED_ARRAY),
             Ok(i) if i < a.len() => {
                 // Keep the layout: the new first element takes the old first's prefix.
                 let prefix = a
@@ -370,6 +519,12 @@ fn remove(slot: Slot<'_>, key: &str) -> Result<(), DriverError> {
             _ => false,
         },
         Slot::Tables(a) => match key.parse::<usize>() {
+            // An empty array of tables prints as nothing: the key would go.
+            Ok(0) if a.len() == 1 => {
+                return Err(DriverError::Unsupported(
+                    "that's the array's only table: remove the whole array instead",
+                ));
+            }
             Ok(i) if i < a.len() => {
                 a.remove(i);
                 true

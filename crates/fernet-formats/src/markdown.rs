@@ -3,7 +3,7 @@
 
 use std::ops::Range;
 
-use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use crate::{
     Builder, Caps, Driver, DriverError, Edit, NewValue, NodeId, NodeKind, ScalarType, Tree,
@@ -23,11 +23,13 @@ struct Heading {
     text: String,
 }
 
-/// Every heading, in order.
+/// Every heading, in order. YAML front matter (`---` … `---` at the very
+/// start) is a metadata block, so it stays in the root's body.
 fn headings(s: &str) -> Vec<Heading> {
     let mut out = Vec::new();
     let mut current: Option<(usize, Range<usize>, String)> = None;
-    for (ev, range) in Parser::new(s).into_offset_iter() {
+    let parser = Parser::new_ext(s, Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
+    for (ev, range) in parser.into_offset_iter() {
         match ev {
             Event::Start(Tag::Heading { level, .. }) => {
                 current = Some((level_num(level), range, String::new()));
@@ -35,6 +37,12 @@ fn headings(s: &str) -> Vec<Heading> {
             Event::Text(t) | Event::Code(t) => {
                 if let Some((_, _, text)) = &mut current {
                     text.push_str(&t);
+                }
+            }
+            // A setext heading can span lines: `Foo\nbar\n===` is "Foo bar".
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some((_, _, text)) = &mut current {
+                    text.push(' ');
                 }
             }
             Event::End(TagEnd::Heading(_)) => {
@@ -149,7 +157,7 @@ impl Driver for Markdown {
         let (s, _) = crate::text(src)?;
         let id = tree.get(ptr).ok_or(DriverError::NotFound)?;
         let node = tree.node(id);
-        let out = match edit {
+        match edit {
             Edit::SetScalar(text) => {
                 if node.kind != NodeKind::Scalar(ScalarType::Text) {
                     return Err(DriverError::WrongKind(
@@ -171,7 +179,10 @@ impl Driver for Markdown {
                 } else {
                     ""
                 };
-                let literal = if newline {
+                // An empty body written back empty stays exactly as it was.
+                let literal = if text.is_empty() && span.is_empty() {
+                    String::new()
+                } else if newline {
                     format!("{lead}{text}\n")
                 } else {
                     format!("{lead}{text}")
@@ -179,16 +190,14 @@ impl Driver for Markdown {
                 let out = crate::replace(src, span, &literal);
                 crate::check_scalar(self, &out, ptr, ScalarType::Text, text)?;
                 same_elsewhere(&leaves(&tree), &leaves(&self.parse(&out)?), ptr)?;
-                return Ok(out);
+                Ok(out)
             }
-            Edit::Insert { key, value } => {
-                return self.insert(src, s, &tree, ptr, id, &key, &value);
-            }
+            Edit::Insert { key, value } => self.insert(src, s, &tree, ptr, id, &key, &value),
             Edit::Remove => {
                 let Some((last, _)) = ptr.split_last() else {
                     return Err(DriverError::Unsupported("can't remove the whole document"));
                 };
-                if last == BODY {
+                let out = if last == BODY {
                     // A section always has a body: removing it empties it.
                     let span = node.value_span.clone();
                     let keep = if span.end < s.len() && !span.is_empty() {
@@ -196,16 +205,18 @@ impl Driver for Markdown {
                     } else {
                         ""
                     };
-                    crate::replace(src, span, keep)
+                    // Emptying a body can still change other sections (a
+                    // link reference definition that a heading used).
+                    let out = crate::replace(src, span, keep);
+                    crate::check_scalar(self, &out, ptr, ScalarType::Text, "")?;
+                    out
                 } else {
-                    let out = crate::replace(src, node.span.clone(), "");
-                    same_elsewhere(&leaves(&tree), &leaves(&self.parse(&out)?), ptr)?;
-                    return Ok(out);
-                }
+                    crate::replace(src, node.span.clone(), "")
+                };
+                same_elsewhere(&leaves(&tree), &leaves(&self.parse(&out)?), ptr)?;
+                Ok(out)
             }
-        };
-        self.parse(&out)?;
-        Ok(out)
+        }
     }
 
     fn capabilities(&self) -> Caps {

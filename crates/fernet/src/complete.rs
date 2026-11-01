@@ -68,16 +68,38 @@ pub(crate) fn candidates(f: &Fernet, cwd: &std::path::Path, word: &str) -> Vec<S
         None => ("", word),
     };
     let mut out = Vec::new();
-    // `name@…`: time specs, marks and the version listing.
+    let base = if dir.is_empty() { "." } else { dir };
+    let Ok(parent) = f.resolve_user_path(cwd, OsStr::new(base)) else {
+        return out;
+    };
+    // Real names (and keys) first: they win over lenses.
+    let lens_base = prefix.rfind('@').map(|at| &prefix[..at]);
+    let mut real_kind = None;
+    if let Ok(entries) = f.list(&parent) {
+        for e in entries {
+            let name = e.name.to_string_lossy();
+            if lens_base == Some(&*name) {
+                real_kind = Some(e.kind);
+            }
+            if name.starts_with(prefix) {
+                let slash = if e.kind == EntryKind::Dir { "/" } else { "" };
+                out.push(format!("{dir}{name}{slash}"));
+            }
+        }
+    }
+    // Inside a file, `@` and `#` are part of a key, never lenses.
+    if matches!(parent, Resolved::Inside { .. }) {
+        return out;
+    }
+    // `name@…`: time specs, marks and, for files, the version listing.
     if let Some(at) = prefix.rfind('@') {
         let (name, spec) = (&prefix[..at], &prefix[at + 1..]);
-        let mut specs: Vec<String> = vec![
-            "/".into(),
-            "first".into(),
-            "~1".into(),
-            "-1h".into(),
-            "-1d".into(),
-        ];
+        let file = real_kind != Some(EntryKind::Dir);
+        let mut specs: Vec<String> = Vec::new();
+        if file {
+            specs.extend(["/".into(), "~1".into()]);
+        }
+        specs.extend(["first".into(), "-1h".into(), "-1d".into()]);
         specs.extend(DayName::ALL.iter().map(|d| d.as_str().to_owned()));
         if let Some(store) = f.store() {
             specs.extend(store.marks().unwrap_or_default().into_keys());
@@ -90,27 +112,16 @@ pub(crate) fn candidates(f: &Fernet, cwd: &std::path::Path, word: &str) -> Vec<S
         );
         return out;
     }
-    // `name#`: open the file.
+    // `name#`: open a structured file.
     if let Some(name) = prefix.strip_suffix('#') {
         let path = format!("{dir}{prefix}");
-        if matches!(
-            f.resolve_user_path(cwd, OsStr::new(&path)),
-            Ok(Resolved::Inside { .. })
-        ) {
+        if let Ok(Resolved::Inside { node, .. }) = f.resolve_user_path(cwd, OsStr::new(&path))
+            && matches!(
+                node,
+                fernet_fs_core::NodeKind::Object | fernet_fs_core::NodeKind::Array
+            )
+        {
             out.push(format!("{dir}{name}#/"));
-        }
-        return out;
-    }
-    let base = if dir.is_empty() { "." } else { dir };
-    let Ok(r) = f.resolve_user_path(cwd, OsStr::new(base)) else {
-        return out;
-    };
-    let Ok(entries) = f.list(&r) else { return out };
-    for e in entries {
-        let name = e.name.to_string_lossy();
-        if name.starts_with(prefix) {
-            let slash = if e.kind == EntryKind::Dir { "/" } else { "" };
-            out.push(format!("{dir}{name}{slash}"));
         }
     }
     out

@@ -6,11 +6,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use fernet_fs_path::{FernetPath, MarkName};
-use fernet_fs_store::{Hash, Kind, Record, Store, Version, VersionId};
+use fernet_fs_store::{Config, Hash, Kind, Record, Store, Version, VersionId};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 use crate::time::{basic_name, nanos};
-use crate::{Entry, EntryKind, Error, Fernet, Resolved, Result, STORE_DIR, Source};
+use crate::{Entry, EntryKind, Error, Fernet, Resolved, Result, STORE_DIR, Source, is_store_name};
 
 /// Default ignore patterns (brief 4.4), plus editors' temporary files
 /// (brief 4.6): vim swap and backup files and its `4913` probe, Emacs lock
@@ -53,13 +53,13 @@ impl Ignore {
         if let Some(e) = b.add(root.join(".fernetignore")) {
             tracing::debug!(error = %e, ".fernetignore");
         }
-        let store = root.join(STORE_DIR);
-        for p in config_patterns(&store) {
+        // Problems in config.toml are reported by the store when it opens.
+        let config = Config::load(&root.join(STORE_DIR));
+        for p in config.patterns() {
             let _ = b.add_line(None, &p);
         }
         let rules = b.build().unwrap_or_else(|_| Gitignore::empty());
-        let max_file =
-            fernet_fs_store::config_u64(&store, "max_file_size").unwrap_or(DEFAULT_MAX_FILE);
+        let max_file = config.u64("max_file_size").unwrap_or(DEFAULT_MAX_FILE);
         Self {
             root: root.to_owned(),
             rules,
@@ -68,6 +68,10 @@ impl Ignore {
     }
 
     /// Whether `path` (absolute, under the root) is ignored.
+    ///
+    /// Gitignore semantics, the same as the tree walk: a path under an
+    /// ignored directory is ignored even if a later `!pattern` names it,
+    /// because the walk never enters that directory.
     #[must_use]
     pub fn ignored(&self, path: &Path, is_dir: bool) -> bool {
         let Ok(rel) = path.strip_prefix(&self.root) else {
@@ -76,13 +80,21 @@ impl Ignore {
         if rel
             .components()
             .next()
-            .is_some_and(|c| c.as_os_str() == STORE_DIR)
+            .is_some_and(|c| is_store_name(c.as_os_str()))
         {
             return true;
         }
-        self.rules
-            .matched_path_or_any_parents(rel, is_dir)
-            .is_ignore()
+        // Ancestors from the top down, as the walk meets them.
+        let mut ancestors: Vec<&Path> = rel
+            .ancestors()
+            .skip(1)
+            .filter(|a| !a.as_os_str().is_empty())
+            .collect();
+        ancestors.reverse();
+        ancestors
+            .into_iter()
+            .any(|a| self.rules.matched(a, true).is_ignore())
+            || self.rules.matched(rel, is_dir).is_ignore()
     }
 
     /// Files larger than this aren't captured.
@@ -90,31 +102,6 @@ impl Ignore {
     pub fn max_file(&self) -> u64 {
         self.max_file
     }
-}
-
-/// `patterns = ["a", "b"]` from `config.toml`, read with a line scan.
-fn config_patterns(store: &Path) -> Vec<String> {
-    let Ok(text) = fs::read_to_string(store.join("config.toml")) else {
-        return Vec::new();
-    };
-    text.lines()
-        .find_map(|l| {
-            l.trim()
-                .strip_prefix("patterns")
-                .map(str::trim)?
-                .strip_prefix('=')
-                .map(str::trim)
-                .map(str::to_owned)
-        })
-        .and_then(|v| v.strip_prefix('[')?.strip_suffix(']').map(str::to_owned))
-        .map(|inner| {
-            inner
-                .split(',')
-                .map(|p| p.trim().trim_matches('"').to_owned())
-                .filter(|p| !p.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// One layer of a core sample: a value and when it appeared.
@@ -140,6 +127,62 @@ fn tombstone(rel: &str, time: i64) -> Record {
     }
 }
 
+/// What's on disk at a path, for deciding whether its history ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnDisk {
+    /// A regular file, reached without passing through a symlink.
+    File,
+    /// Nothing, something other than a regular file, or a file reached only
+    /// through a symlinked directory (captures never follow links).
+    Gone,
+    /// Can't tell (permission denied and the like): leave history alone.
+    Unknown,
+}
+
+/// Whether `err` means the path isn't there (a missing component, or a
+/// component that's now a file).
+fn is_gone(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+/// Whether `path`'s parent directory is reached through a symlink: its
+/// canonical location differs from its spelling (the root is canonical).
+/// `None` when that can't be told.
+fn behind_link(path: &Path) -> Option<bool> {
+    let parent = path.parent()?;
+    match fs::canonicalize(parent) {
+        Ok(c) => Some(c != parent),
+        Err(e) if is_gone(&e) => Some(false),
+        Err(_) => None,
+    }
+}
+
+fn on_disk(path: &Path) -> OnDisk {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.is_file() => match behind_link(path) {
+            Some(false) => OnDisk::File,
+            Some(true) => OnDisk::Gone,
+            None => OnDisk::Unknown,
+        },
+        Ok(_) => OnDisk::Gone,
+        Err(e) if is_gone(&e) => OnDisk::Gone,
+        Err(_) => OnDisk::Unknown,
+    }
+}
+
+/// What a tree capture recorded, and what it couldn't read.
+#[derive(Debug, Default)]
+pub struct TreeCapture {
+    /// Versions and tombstones recorded.
+    pub captured: usize,
+    /// Paths skipped because they couldn't be read, with the reason. Their
+    /// history is left as it was.
+    pub skipped: Vec<(PathBuf, String)>,
+}
+
 /// Tombstones every live path under `rel/` whose file is gone from disk.
 /// Returns the first record written.
 fn tombstone_under(
@@ -153,7 +196,7 @@ fn tombstone_under(
         let Some(v) = store.version_at(&p, i64::MAX)?.filter(|v| v.hash.is_some()) else {
             continue;
         };
-        if fs::symlink_metadata(root.join(&p)).is_ok_and(|m| m.is_file()) {
+        if on_disk(&root.join(&p)) != OnDisk::Gone {
             continue;
         }
         let id = store.append(&tombstone(&p, time.max(v.time)))?;
@@ -317,35 +360,46 @@ impl Fernet {
         // Never record behind the path's latest record: a tree capture stamps
         // a time taken before its walk, and a concurrent write may be newer.
         let time = latest.as_ref().map_or(time, |v| time.max(v.time));
+        // Gone, or not a regular file (a directory, symlink or other), or
+        // reached through a symlinked directory, which captures never follow
+        // (it may point outside the root, or into the store): it ended, and so
+        // did anything that lived under it.
+        let ended = |store: &mut Store| -> Result<Option<VersionId>> {
+            let first = if live {
+                Some(store.append(&tombstone(&rel, time))?)
+            } else {
+                None
+            };
+            let under = tombstone_under(store, self.root(), &rel, time)?;
+            Ok(first.or(under))
+        };
         let meta = match fs::symlink_metadata(&path) {
             Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Gone: the path itself, and anything that lived under it (a
-                // removed or moved directory).
-                let mut first = None;
-                if live {
-                    first = Some(store.append(&tombstone(&rel, time))?);
-                }
-                let under = tombstone_under(&mut store, self.root(), &rel, time)?;
-                return Ok(first.or(under));
-            }
+            Err(e) if is_gone(&e) => return ended(&mut store),
             Err(e) => return Err(Error::io(&path, e)),
         };
-        if !meta.is_file() {
-            // A file replaced by a directory, symlink or other: it ended.
-            return if live {
-                Ok(Some(store.append(&tombstone(&rel, time))?))
-            } else {
-                Ok(None)
-            };
+        match behind_link(&path) {
+            Some(false) => {}
+            Some(true) => return ended(&mut store),
+            None => {
+                return Err(Error::io(
+                    &path,
+                    std::io::Error::other("can't resolve the parent directory"),
+                ));
+            }
         }
+        if !meta.is_file() {
+            return ended(&mut store);
+        }
+        // A directory replaced by this file: whatever lived under it ended.
+        let under = tombstone_under(&mut store, self.root(), &rel, time)?;
         if meta.len() > self.ignore().max_file() {
-            return Ok(None);
+            return Ok(under);
         }
         let bytes = fs::read(&path).map_err(|e| Error::io(&path, e))?;
         let hash = Hash::of(&bytes);
         if latest.as_ref().and_then(|v| v.hash) == Some(hash) {
-            return Ok(None);
+            return Ok(under);
         }
         store.put_blob(&bytes)?;
         let r = Record {
@@ -362,18 +416,42 @@ impl Fernet {
     /// Captures every file under `dir` (and records tombstones for files with
     /// history that are gone) as one moment: every record gets the same time,
     /// so the tree's past state is never half-captured. Returns how many
-    /// versions were recorded.
+    /// versions were recorded. Unreadable paths are skipped (and logged); see
+    /// [`Fernet::capture_tree`] to get them.
     ///
     /// # Errors
     ///
-    /// As [`Fernet::snapshot`].
+    /// Store errors.
     pub fn snapshot_tree(&self, dir: &Path) -> Result<usize> {
+        let report = self.capture_tree(dir)?;
+        for (path, why) in &report.skipped {
+            tracing::warn!(path = %path.display(), error = %why, "skipped");
+        }
+        Ok(report.captured)
+    }
+
+    /// [`Fernet::snapshot_tree`], reporting what couldn't be read. Symlinks
+    /// are never followed: a `dir` that is a symlink is captured as a
+    /// non-file (its history, if any, ends).
+    ///
+    /// # Errors
+    ///
+    /// Store errors. I/O errors on single paths are skipped and reported.
+    pub fn capture_tree(&self, dir: &Path) -> Result<TreeCapture> {
         let time = nanos(self.now());
+        let mut report = TreeCapture::default();
+        let real_dir = fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir());
+        if !real_dir && dir != self.root() {
+            let r = self.snapshot_at(dir, time);
+            tally(&mut report, r, dir)?;
+            self.flush()?;
+            return Ok(report);
+        }
         let mut files = Vec::new();
-        walk(self, dir, &mut files)?;
-        let mut count = 0;
+        walk(self, dir, &mut files, &mut report.skipped);
         for f in &files {
-            count += usize::from(self.snapshot_at(f, time)?.is_some());
+            let r = self.snapshot_at(f, time);
+            tally(&mut report, r, f)?;
         }
         // Tombstones for vanished files.
         let gone: Vec<PathBuf> = {
@@ -381,24 +459,25 @@ impl Fernet {
             let prefix = match self.rel(dir) {
                 Some(r) if r.is_empty() => String::new(),
                 Some(r) => format!("{r}/"),
-                None => return Ok(count),
+                None => return Ok(report),
             };
             let mut gone = Vec::new();
             for p in store.paths(&prefix)? {
                 let alive = store.versions(&p)?.last().is_some_and(|v| v.hash.is_some());
                 let path = self.root().join(&p);
                 // Gone, or no longer a regular file.
-                if alive && !fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+                if alive && on_disk(&path) == OnDisk::Gone {
                     gone.push(path);
                 }
             }
             gone
         };
         for g in gone {
-            count += usize::from(self.snapshot_at(&g, time)?.is_some());
+            let r = self.snapshot_at(&g, time);
+            tally(&mut report, r, &g)?;
         }
         self.flush()?;
-        Ok(count)
+        Ok(report)
     }
 
     /// Makes recorded history durable now.
@@ -542,17 +621,41 @@ impl Fernet {
     }
 }
 
-/// Every non-ignored regular file under `dir`.
-fn walk(f: &Fernet, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+/// Counts one capture in `report`; an I/O error on the path is a skip, any
+/// other error is returned.
+fn tally(report: &mut TreeCapture, r: Result<Option<VersionId>>, path: &Path) -> Result<()> {
+    match r {
+        Ok(v) => {
+            report.captured += usize::from(v.is_some());
+            Ok(())
+        }
+        Err(Error::Io { source, .. }) => {
+            report
+                .skipped
+                .push((path.to_owned(), source.to_string().to_lowercase()));
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Every non-ignored regular file under `dir`, never following symlinks.
+/// Directories that can't be read go in `skipped`.
+fn walk(f: &Fernet, dir: &Path, out: &mut Vec<PathBuf>, skipped: &mut Vec<(PathBuf, String)>) {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(Error::io(dir, e)),
+        Err(e) if is_gone(&e) => return,
+        Err(e) => {
+            skipped.push((dir.to_owned(), e.to_string().to_lowercase()));
+            return;
+        }
     };
     let mut names: Vec<(OsString, PathBuf)> = Vec::new();
     for e in entries {
-        let e = e.map_err(|e| Error::io(dir, e))?;
-        names.push((e.file_name(), e.path()));
+        match e {
+            Ok(e) => names.push((e.file_name(), e.path())),
+            Err(e) => skipped.push((dir.to_owned(), e.to_string().to_lowercase())),
+        }
     }
     names.sort();
     for (_, path) in names {
@@ -563,10 +666,9 @@ fn walk(f: &Fernet, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
             continue;
         }
         if meta.is_dir() {
-            walk(f, &path, out)?;
+            walk(f, &path, out, skipped);
         } else if meta.is_file() {
             out.push(path);
         }
     }
-    Ok(())
 }

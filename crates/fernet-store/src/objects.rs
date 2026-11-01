@@ -29,13 +29,18 @@ impl Objects {
         self.path(hash).is_file()
     }
 
-    /// Stores `bytes` if not already present. Returns the hash. The blob is
-    /// durable when this returns: temp file, fsync, rename, fsync directory.
+    /// Stores `bytes` if not already present and intact. Returns the hash.
+    /// The blob is durable when this returns: temp file, fsync, rename, fsync
+    /// directory. A stored blob that doesn't decompress to `bytes` (damaged
+    /// on disk) is replaced, so new records never point at bad content.
     pub(crate) fn put(&self, bytes: &[u8]) -> Result<Hash> {
         let hash = Hash::of(bytes);
         let path = self.path(&hash);
         if path.is_file() {
-            return Ok(hash);
+            if self.get(&hash, bytes.len() as u64).is_ok() {
+                return Ok(hash);
+            }
+            tracing::warn!(blob = %hash.to_hex(), "replacing a damaged blob");
         }
         let parent = path
             .parent()

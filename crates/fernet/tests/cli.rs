@@ -394,3 +394,268 @@ fn write_takes_binary_stdin_for_files() {
         .assert()
         .code(3);
 }
+
+#[test]
+#[cfg(unix)]
+fn writes_stay_in_the_root_and_out_of_the_store() {
+    use std::os::unix::fs::symlink;
+    let outer = tempfile::tempdir().unwrap();
+    let p = outer.path().join("root");
+    fs::create_dir(&p).unwrap();
+    fs::write(p.join("notes.txt"), "v1\n").unwrap();
+    fs::create_dir(p.join("sub")).unwrap();
+    fernet(&p).arg("init").assert().success();
+    fs::create_dir(outer.path().join("outside")).unwrap();
+    symlink("../outside", p.join("out")).unwrap();
+    symlink(".", p.join("self")).unwrap();
+    symlink(".fernet/MANIFEST", p.join("mlink")).unwrap();
+    let manifest = fs::read(p.join(".fernet/MANIFEST")).unwrap();
+
+    // New files through a link out of the root, or into the store: refused.
+    for path in ["out/new", "mlink"] {
+        fernet(&p).args(["write", path, "x"]).assert().code(3);
+    }
+    // Behind a link to the root, the store is hidden: not found.
+    for path in ["self/.fernet/new", "self/.fernet/MANIFEST"] {
+        fernet(&p).args(["write", path, "x"]).assert().code(1);
+    }
+    assert!(!outer.path().join("outside/new").exists());
+    assert!(!p.join(".fernet/new").exists());
+    assert_eq!(fs::read(p.join(".fernet/MANIFEST")).unwrap(), manifest);
+    // The store stays hidden behind a link to the root.
+    fernet(&p).args(["ls", "self/.fernet"]).assert().code(1);
+    fernet(&p).arg("verify").assert().success();
+
+    // A lens that finds nothing never becomes a file; the past is read-only.
+    for path in [
+        "notes.txt@~5",
+        "sub@~1",
+        "sub@first/new.txt",
+        "notes.txt@/new",
+    ] {
+        fernet(&p).args(["write", path, "x"]).assert().code(4);
+    }
+    fernet(&p)
+        .args(["write", "notes.txt#", "x"])
+        .assert()
+        .code(3);
+    let names: Vec<_> = fs::read_dir(&p)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.contains(['@', '#']))
+        .collect();
+    assert!(names.is_empty(), "{names:?}");
+    // Names that only look like lenses are still plain files.
+    fernet(&p)
+        .args(["write", "user@example.com", "x"])
+        .assert()
+        .success();
+    assert!(p.join("user@example.com").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn paths_through_a_linked_root() {
+    let outer = tempfile::tempdir().unwrap();
+    let p = outer.path().join("root");
+    fs::create_dir(&p).unwrap();
+    fs::write(p.join("notes.txt"), "hi\n").unwrap();
+    fernet(&p).arg("init").assert().success();
+    std::os::unix::fs::symlink("root", outer.path().join("link")).unwrap();
+    let abs = outer.path().join("link/notes.txt");
+    fernet(&p)
+        .arg("cat")
+        .arg(&abs)
+        .assert()
+        .success()
+        .stdout("hi\n");
+    fernet(outer.path())
+        .args(["--root", "link", "cat", "link/notes.txt"])
+        .assert()
+        .success()
+        .stdout("hi\n");
+}
+
+#[test]
+fn a_stamp_selects_its_listing_entry() {
+    let tmp = history_fixture();
+    let p = tmp.path();
+    for v in ["v2", "v3", "v4"] {
+        fernet(p).args(["write", "notes.md", v]).assert().success();
+    }
+    let out = fernet(p).args(["ls", "notes.md@"]).output().unwrap();
+    let listing = String::from_utf8(out.stdout).unwrap();
+    for name in listing.lines() {
+        let by_listing = fernet(p)
+            .arg("cat")
+            .arg(format!("notes.md@/{name}"))
+            .output()
+            .unwrap()
+            .stdout;
+        if name.contains('.') {
+            continue; // `.N` names are listing-only
+        }
+        let by_stamp = fernet(p)
+            .arg("cat")
+            .arg(format!("notes.md@{name}"))
+            .output()
+            .unwrap()
+            .stdout;
+        assert_eq!(by_stamp, by_listing, "{name}");
+    }
+    fernet(p)
+        .args(["cat", "notes.md@9999-12-31"])
+        .assert()
+        .success()
+        .stdout("v4");
+}
+
+#[test]
+fn completion_lets_real_names_and_keys_win() {
+    let tmp = history_fixture();
+    let p = tmp.path();
+    fs::write(p.join("user@example.com"), "x").unwrap();
+    fs::write(p.join("e.json"), r#"{"emails":{"a@b.com":1,"x#":2}}"#).unwrap();
+    fs::create_dir(p.join("sub")).unwrap();
+    let complete = |word: &str| {
+        let out = fernet(p).args(["complete", "--", word]).output().unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert_eq!(complete("user@ex"), "user@example.com\n");
+    assert_eq!(complete("e.json#/emails/a@"), "e.json#/emails/a@b.com\n");
+    assert_eq!(complete("e.json#/emails/x#"), "e.json#/emails/x#\n");
+    let dir = complete("sub@");
+    assert!(dir.contains("sub@first") && !dir.contains("sub@/") && !dir.contains("sub@~1"));
+    let file = complete("notes.md@");
+    assert!(file.contains("notes.md@/") && file.contains("notes.md@~1"));
+}
+
+/// A nested `.fernet` directory that isn't a store is user data: root
+/// discovery keeps walking up to the real store.
+#[test]
+fn a_nested_fernet_directory_does_not_stop_root_discovery() {
+    let tmp = history_fixture();
+    let p = tmp.path();
+    fs::create_dir_all(p.join("sub/.fernet")).unwrap();
+    fs::create_dir_all(p.join("sub/deep")).unwrap();
+    fernet(&p.join("sub/deep"))
+        .args(["cat", "../../notes.md@first"])
+        .assert()
+        .success()
+        .stdout("hello\n");
+}
+
+/// A `config.toml` that doesn't parse is reported, and compaction refuses
+/// rather than applying default retention.
+#[test]
+fn a_broken_config_is_reported() {
+    let tmp = history_fixture();
+    let p = tmp.path();
+    fs::write(
+        p.join(".fernet/config.toml"),
+        "[retention\nsnow_hours = 1\n",
+    )
+    .unwrap();
+    fernet(p)
+        .arg("log")
+        .assert()
+        .success()
+        .stderr(predicate_contains("config.toml is not valid toml"));
+    fernet(p)
+        .arg("compact")
+        .assert()
+        .code(5)
+        .stderr(predicate_contains("config.toml is not valid toml"));
+    // Completion stays quiet.
+    fernet(p)
+        .args(["complete", "no"])
+        .assert()
+        .success()
+        .stderr("");
+}
+
+/// An unreadable file doesn't abort init: it's skipped with a warning.
+#[test]
+fn init_skips_unreadable_files() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    fs::write(p.join("a.txt"), "a").unwrap();
+    fs::write(p.join("secret.txt"), "s").unwrap();
+    fs::set_permissions(p.join("secret.txt"), fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(p.join("secret.txt")).is_ok() {
+        return; // Running as root: permissions don't apply.
+    }
+    fernet(p)
+        .arg("init")
+        .assert()
+        .success()
+        .stdout(predicate_contains("(1 file captured)"))
+        .stderr(predicate_contains("skipped secret.txt"));
+    fernet(p).args(["cat", "a.txt@first"]).assert().success();
+}
+
+/// The watcher never follows symlinks to directories and applies ignore
+/// rules as the initial walk does.
+#[test]
+fn watch_ignores_symlinked_directories_and_reincluded_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(p.join(".fernetignore"), "logs/\n!logs/keep.txt\n").unwrap();
+    fs::create_dir(p.join("logs")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), p.join("out")).unwrap();
+    std::os::unix::fs::symlink(".", p.join("self")).unwrap();
+    fernet(p).arg("init").assert().success();
+    let bin = assert_cmd::cargo::cargo_bin("fernet");
+    let mut child = std::process::Command::new(bin)
+        .arg("watch")
+        .current_dir(p)
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    fs::write(outside.path().join("secret.txt"), "s").unwrap();
+    fs::write(p.join("logs/keep.txt"), "k").unwrap();
+    fs::write(p.join("a.txt"), "a").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut log = String::new();
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let out = fernet(p).arg("log").output().unwrap();
+        log = String::from_utf8_lossy(&out.stdout).into_owned();
+        if log.contains("a.txt") {
+            break;
+        }
+    }
+    // Give stragglers from the same batch a moment.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let out = fernet(p).arg("log").output().unwrap();
+    child.kill().unwrap();
+    let _ = child.wait();
+    let final_log = String::from_utf8_lossy(&out.stdout);
+    assert!(log.contains("a.txt"), "watcher didn't capture a.txt: {log}");
+    for bad in ["secret.txt", "keep.txt", "self/", "out/", "MANIFEST"] {
+        assert!(!final_log.contains(bad), "{bad} captured:\n{final_log}");
+    }
+}
+
+#[test]
+fn a_time_copied_from_log_selects_that_version() {
+    let tmp = history_fixture();
+    let p = tmp.path();
+    for v in ["v2", "v3"] {
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fernet(p).args(["write", "notes.md", v]).assert().success();
+        let out = fernet(p).args(["log", "notes.md"]).output().unwrap();
+        let log = String::from_utf8(out.stdout).unwrap();
+        let mut words = log.lines().next().unwrap().split_whitespace();
+        let (date, time) = (words.next().unwrap(), words.next().unwrap());
+        fernet(p)
+            .arg("cat")
+            .arg(format!("notes.md@{date}T{time}"))
+            .assert()
+            .success()
+            .stdout(v);
+    }
+}

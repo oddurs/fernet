@@ -674,3 +674,215 @@ fn review_regressions() {
         "# A\nhello"
     );
 }
+
+/// The value at `p` after parsing `src` with `d`.
+fn value_at(d: &dyn Driver, src: &str, p: &str) -> Option<(NodeKind, String)> {
+    let t = d.parse(src.as_bytes()).unwrap();
+    t.get(&ptr(p)).map(|id| {
+        let n = t.node(id);
+        (n.kind, n.text.clone())
+    })
+}
+
+/// Edge cases in the TOML driver's inserts and removes.
+#[test]
+fn toml_edge_case_regressions() {
+    // Mixed line endings: untouched lines keep theirs, even inside a
+    // multi-line string, and the string's value doesn't change.
+    let src = "a = 1\r\ns = \"\"\"x\ny\"\"\"\n";
+    let out = ins(&Toml, src, "", "n", text("2")).unwrap();
+    assert_eq!(out, "a = 1\r\ns = \"\"\"x\ny\"\"\"\nn = 2\n");
+    assert_eq!(value_at(&Toml, &out, "s").unwrap().1, "x\ny");
+    let src = "a = 1\r\nb = 2\r\ns = \"\"\"x\ny\"\"\"\r\n";
+    let out = ins(&Toml, src, "", "n", text("2")).unwrap();
+    assert_eq!(out, format!("{src}n = 2\r\n"));
+    assert_eq!(
+        rm(&Toml, src, "b").unwrap(),
+        "a = 1\r\ns = \"\"\"x\ny\"\"\"\r\n"
+    );
+    // New text is a TOML value only if it's exactly one; else a string.
+    let src = "a = 1\n";
+    for (t, kind, want) in [
+        ("1\nc = 2", ScalarType::String, "1\nc = 2"),
+        ("5 # five", ScalarType::String, "5 # five"),
+        ("5", ScalarType::Integer, "5"),
+        ("5\n", ScalarType::Integer, "5"),
+        (" 5", ScalarType::String, " 5"),
+        ("1979-05-27", ScalarType::Datetime, "1979-05-27"),
+    ] {
+        let out = ins(&Toml, src, "", "b", text(t)).unwrap();
+        assert_eq!(
+            value_at(&Toml, &out, "b"),
+            Some((NodeKind::Scalar(kind), want.to_owned())),
+            "{t:?} -> {out:?}"
+        );
+        assert!(value_at(&Toml, &out, "c").is_none(), "{t:?}");
+        assert!(out.starts_with(src));
+    }
+    // Duplicate lines aren't a reorder.
+    let src = "[server]\nenabled = true\n[client]\nport = 1\n";
+    assert_eq!(
+        ins(&Toml, src, "client", "enabled", text("true")).unwrap(),
+        format!("{src}enabled = true\n")
+    );
+    let src = "[[p]]\nn = 1\n[[p]]\nn = 2\n";
+    assert_eq!(
+        ins(&Toml, src, "p", "2", NewValue::EmptyObject).unwrap(),
+        format!("{src}\n[[p]]\n")
+    );
+    assert_eq!(rm(&Toml, src, "p/0").unwrap(), "[[p]]\nn = 2\n");
+    assert_eq!(rm(&Toml, src, "p/1").unwrap(), "[[p]]\nn = 1\n");
+    // ... but real reorders are still refused.
+    assert!(ins(&Toml, "a.b = 1\nc = 2\na.d = 3\n", "", "e", text("4")).is_err());
+    // Arrays with per-element comments can't keep them on the right element.
+    let src = "arr = [\n  1, # one\n  2, # two\n  3, # three\n]\n";
+    assert!(matches!(
+        rm(&Toml, src, "arr/1"),
+        Err(DriverError::Unsupported(_))
+    ));
+    assert!(matches!(
+        ins(&Toml, src, "arr", "3", text("4")),
+        Err(DriverError::Unsupported(_))
+    ));
+    assert!(matches!(
+        rm(&Toml, src, "arr/9"),
+        Err(DriverError::NotFound)
+    ));
+    // Without comments they still work.
+    assert_eq!(
+        rm(&Toml, "arr = [\n  1,\n  2,\n  3,\n]\n", "arr/1").unwrap(),
+        "arr = [\n  1,\n  3,\n]\n"
+    );
+    // The only table of an array of tables: refused, not the key deleted.
+    assert!(matches!(
+        rm(&Toml, "x = 1\n[[p]]\nn = 1\n", "p/0"),
+        Err(DriverError::Unsupported(_))
+    ));
+    assert_eq!(rm(&Toml, "x = 1\n[[p]]\nn = 1\n", "p").unwrap(), "x = 1\n");
+}
+
+/// Edge cases in the Markdown driver.
+#[test]
+fn markdown_edge_case_regressions() {
+    use fernet_fs_formats::Markdown;
+    let keys = |src: &str| {
+        let t = Markdown.parse(src.as_bytes()).unwrap();
+        t.node(t.root)
+            .children
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect::<Vec<_>>()
+    };
+    // Emptying a body that holds a link definition a heading uses is refused.
+    let src = "# A\n[foo]: /url\n\n# [foo]\ntext\n";
+    assert_eq!(keys(src), ["body", "A", "foo"]);
+    assert!(matches!(
+        rm(&Markdown, src, "A/body"),
+        Err(DriverError::InvalidValue(_))
+    ));
+    // Emptying an ordinary body still works.
+    assert_eq!(
+        rm(&Markdown, "# A\nx\n\n# B\n", "A/body").unwrap(),
+        "# A\n\n# B\n"
+    );
+    // An empty body written back as read is byte-identical.
+    for (src, p) in [
+        ("# A\n# B\n", "A/body"),
+        ("# A\n# B\n", "body"),
+        ("# A", "A/body"),
+        ("# A\n", "A/body"),
+        ("# A\n\n# B\n", "A/body"),
+    ] {
+        let (_, read) = value_at(&Markdown, src, p).unwrap();
+        assert_eq!(
+            set(&Markdown, src, p, &format!("{read}\n")).unwrap(),
+            src,
+            "{src:?} {p}"
+        );
+        assert_eq!(set(&Markdown, src, p, &read).unwrap(), src, "{src:?} {p}");
+    }
+    assert_eq!(
+        set(&Markdown, "# A\n# B\n", "A/body", "x").unwrap(),
+        "# A\nx\n# B\n"
+    );
+    // YAML front matter is part of the root body, not a heading.
+    let src = "---\ntitle: Hello\n---\n# Intro\nhi\n";
+    assert_eq!(keys(src), ["body", "Intro"]);
+    assert_eq!(
+        value_at(&Markdown, src, "body").unwrap().1,
+        "---\ntitle: Hello\n---"
+    );
+    assert_eq!(
+        set(&Markdown, src, "body", "---\ntitle: Bye\n---").unwrap(),
+        "---\ntitle: Bye\n---\n# Intro\nhi\n"
+    );
+    // A multi-line setext heading keeps its line break as a space.
+    assert_eq!(keys("Foo\nbar\n===\n"), ["body", "Foo bar"]);
+}
+
+/// Edge cases in the YAML driver.
+#[test]
+fn yaml_edge_case_regressions() {
+    // An empty value can be written, after its colon; a null takes any type.
+    let src = "name:\nport: 80\n";
+    assert_eq!(set(&Yaml, src, "name", "5").unwrap(), "name: 5\nport: 80\n");
+    assert_eq!(
+        set(&Yaml, src, "name", "api").unwrap(),
+        "name: api\nport: 80\n"
+    );
+    assert_eq!(
+        set(&Yaml, src, "name", "true").unwrap(),
+        "name: true\nport: 80\n"
+    );
+    assert_eq!(
+        set(&Yaml, src, "name", "a: b").unwrap(),
+        "name: \"a: b\"\nport: 80\n"
+    );
+    assert_eq!(set(&Yaml, src, "name", "").unwrap(), src);
+    assert_eq!(set(&Yaml, "a: \nb: 1\n", "a", "x").unwrap(), "a: x\nb: 1\n");
+    assert_eq!(
+        set(&Yaml, "a: # note\nb: 1\n", "a", "x").unwrap(),
+        "a: x # note\nb: 1\n"
+    );
+    assert_eq!(
+        set(&Yaml, "\"q\":\nb: 1\n", "q", "1").unwrap(),
+        "\"q\": 1\nb: 1\n"
+    );
+    assert_eq!(
+        set(&Yaml, "{a: , b: 1}\n", "a", "2").unwrap(),
+        "{a: 2, b: 1}\n"
+    );
+    assert_eq!(set(&Yaml, "a: ~\n", "a", "7").unwrap(), "a: 7\n");
+    // ... but other types still keep theirs.
+    assert!(matches!(
+        set(&Yaml, src, "port", "x"),
+        Err(DriverError::InvalidValue(_))
+    ));
+    // `!` or `&` in a comment isn't a tag or anchor.
+    assert_eq!(
+        set(&Yaml, "a: # see !this & that\n  1\n", "a", "2").unwrap(),
+        "a: # see !this & that\n  2\n"
+    );
+    assert_eq!(
+        set(&Yaml, "a: 1 # !x\nb: 2\n", "b", "3").unwrap(),
+        "a: 1 # !x\nb: 3\n"
+    );
+    // Real properties are still read-only, comments or not.
+    assert!(set(&Yaml, "a: !!str # c\n  x\n", "a", "y").is_err());
+    assert!(set(&Yaml, "a: &x # c\n  1\n", "a", "2").is_err());
+}
+
+/// Edge cases in the CSV driver.
+#[test]
+fn csv_edge_case_regressions() {
+    use fernet_fs_formats::Csv;
+    // An empty file has no header, so no columns: a new row is refused.
+    assert!(matches!(
+        ins(&Csv, "", "", "0", NewValue::EmptyObject),
+        Err(DriverError::Unsupported(_))
+    ));
+    // With a header it works, and the row is there.
+    let out = ins(&Csv, "a,b\n", "", "0", NewValue::EmptyObject).unwrap();
+    assert_eq!(out, "a,b\n,\n");
+    assert!(value_at(&Csv, &out, "0/b").is_some());
+}

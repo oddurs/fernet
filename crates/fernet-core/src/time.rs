@@ -25,6 +25,9 @@ pub enum Target {
     First,
     /// The list of versions.
     Listing,
+    /// A listing name: the first version within this UTC second (its start,
+    /// in nanoseconds), or else the latest version before the second ends.
+    Second(i64),
 }
 
 /// Nanoseconds since the Unix epoch, saturating at the `i64` range.
@@ -63,14 +66,14 @@ pub fn resolve(
         TimeSpec::Back(n) => Target::Back(*n),
         TimeSpec::First => Target::First,
         TimeSpec::Now => Target::At(nanos(now)),
-        // The whole second: a version listed under this name is selected.
+        // The version a listing shows under this name.
         TimeSpec::Stamp(st) => {
             let a = AbsoluteTime {
                 date: st.date,
                 time: Some(st.time),
                 offset: Some(Offset::Utc),
             };
-            Target::At(absolute(&a, tz).saturating_add(999_999_999))
+            Target::Second(absolute(&a, tz))
         }
         TimeSpec::Mark(m) => Target::At(*marks.get(m.as_str()).ok_or_else(|| Error::NoMark {
             name: m.to_string(),
@@ -99,6 +102,11 @@ pub fn resolve(
             };
             Target::At(start_of_day(date, tz))
         }
+        // With seconds, the whole second: `fernet log` shows times truncated
+        // to the second, and a time copied from it must select that version.
+        TimeSpec::Absolute(a) if a.time.is_some_and(|t| t.second.is_some()) => {
+            Target::At(absolute(a, tz).saturating_add(999_999_999))
+        }
         TimeSpec::Absolute(a) => Target::At(absolute(a, tz)),
     })
 }
@@ -118,7 +126,13 @@ fn weekday(d: DayName) -> Weekday {
 /// The first instant of `date` in `tz`.
 fn start_of_day(date: Date, tz: &TimeZone) -> i64 {
     date.to_zoned(tz.clone())
-        .map_or(i64::MIN, |z| nanos(z.timestamp()))
+        .map_or(beyond(date.year()), |z| nanos(z.timestamp()))
+}
+
+/// A valid date outside jiff's range (the last hours of 9999 in some zones,
+/// or before year 1): saturate toward the side it lies on.
+fn beyond(year: i16) -> i64 {
+    if year > 1970 { i64::MAX } else { i64::MIN }
 }
 
 fn absolute(a: &AbsoluteTime, tz: &TimeZone) -> i64 {
@@ -152,7 +166,8 @@ fn absolute(a: &AbsoluteTime, tz: &TimeZone) -> i64 {
             Err(_) => return i64::MIN,
         },
     };
-    dt.to_zoned(zone).map_or(i64::MIN, |z| nanos(z.timestamp()))
+    dt.to_zoned(zone)
+        .map_or(beyond(dt.year()), |z| nanos(z.timestamp()))
 }
 
 /// The ISO 8601 basic UTC name of an instant: `20261030T164512Z`.
@@ -217,7 +232,11 @@ mod tests {
         let now = "2026-10-30T16:00:00Z";
         assert_eq!(at("2026-10-01", now), ts("2026-10-01T04:00:00Z"));
         assert_eq!(at("2026-10-01T14:30", now), ts("2026-10-01T18:30:00Z"));
-        assert_eq!(at("2026-10-01T14:30:05Z", now), ts("2026-10-01T14:30:05Z"));
+        // With seconds: the whole second.
+        assert_eq!(
+            at("2026-10-01T14:30:05Z", now),
+            ts("2026-10-01T14:30:05.999999999Z")
+        );
         assert_eq!(
             at("2026-10-01T14:30+02:00", now),
             ts("2026-10-01T12:30:00Z")
@@ -244,8 +263,16 @@ mod tests {
         assert_eq!(r("now").unwrap(), Target::At(nanos(now)));
         assert_eq!(
             r("20261030T120000Z").unwrap(),
-            Target::At(ts("2026-10-30T12:00:00.999999999Z"))
+            Target::Second(ts("2026-10-30T12:00:00Z"))
         );
+        // The end of jiff's range is still in the future, not the past.
+        for late in ["9999-12-31", "9999-12-31T23:59:59Z", "99991231T235959Z"] {
+            let t = r(late).unwrap();
+            assert!(
+                matches!(t, Target::At(n) | Target::Second(n) if n > nanos(now)),
+                "{late}: {t:?}"
+            );
+        }
         assert_eq!(r("").unwrap(), Target::Listing);
         assert_eq!(r("release").unwrap(), Target::At(42));
         assert!(matches!(r("nope"), Err(Error::NoMark { .. })));

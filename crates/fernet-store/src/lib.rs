@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 pub mod compact;
+mod config;
 mod index;
 mod objects;
 pub mod record;
@@ -32,6 +33,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+pub use config::Config;
 use index::{DiskIndex, MemIndex, Tables};
 pub use index::{Position, Version, VersionId};
 pub(crate) use objects::Objects;
@@ -109,6 +111,9 @@ pub enum Error {
     /// Another process holds the writer lock.
     #[error("the store is busy: another fernet process is writing to it")]
     Busy,
+    /// `config.toml` couldn't be read, and the operation won't guess.
+    #[error("{0}")]
+    Config(String),
     /// The store was opened read-only.
     #[error("the store is open read-only")]
     ReadOnly,
@@ -149,6 +154,14 @@ pub enum Error {
 }
 
 impl Error {
+    /// A log segment that was listed but is gone: a lock-less reader racing a
+    /// compaction.
+    fn is_vanished_segment(&self) -> bool {
+        matches!(self, Self::Io { path, source }
+            if source.kind() == std::io::ErrorKind::NotFound
+                && path.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new("log")))
+    }
+
     pub(crate) fn io(path: &Path, source: std::io::Error) -> Self {
         Self::Io {
             path: path.to_owned(),
@@ -185,8 +198,9 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 pub enum Mode {
     /// Take the writer lock; fail with [`Error::Busy`] if another process has it.
     Write,
-    /// Take the lock if it's free (to use and update the persistent index);
-    /// otherwise read the log into memory without touching anything.
+    /// Read the log into memory without touching anything: no lock, no
+    /// index, no writes, so readers never block the writer (or each other)
+    /// and a read-only store can be read.
     Read,
 }
 
@@ -208,6 +222,7 @@ pub struct Store {
     roll_at: u64,
     last_sync: Instant,
     dirty: bool,
+    config_problems: Vec<String>,
 }
 
 /// Default size past which fernet warns about the store: 1 GiB.
@@ -288,7 +303,27 @@ impl Store {
         if format != FORMAT_LINE {
             return Err(Error::Format(format.trim().to_owned()));
         }
-        let lock = take_lock(&dir, mode)?;
+        if mode == Mode::Write {
+            let lock = take_lock(&dir)?;
+            return Self::open_in(dir, Some(lock));
+        }
+        // Lock-less: a compaction may retire the segments the manifest listed
+        // between reading it and reading them. Start over from the manifest.
+        let mut attempt = 0;
+        loop {
+            match Self::open_in(dir.clone(), None) {
+                Err(e) if attempt < READ_RETRIES && e.is_vanished_segment() => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(10 * attempt));
+                }
+                r => return r,
+            }
+        }
+    }
+
+    /// Opens with the lock (write mode) or without it (read mode).
+    fn open_in(dir: PathBuf, lock: Option<File>) -> Result<Self> {
+        let config = Config::load(&dir);
         let segments = read_manifest(&dir)?;
         let last = *segments
             .last()
@@ -334,7 +369,7 @@ impl Store {
             ord: 0,
         };
 
-        let active = if mode == Mode::Write {
+        let active = if lock.is_some() {
             let mut file = OpenOptions::new()
                 .append(true)
                 .open(&last_path)
@@ -357,10 +392,13 @@ impl Store {
             active,
             index: Box::new(MemIndex::default()),
             lock,
-            group_commit: read_group_commit(&dir),
-            roll_at: config_u64(&dir, "segment_bytes").unwrap_or(segment::ROLL_AT),
+            group_commit: config
+                .u64("group_commit_ms")
+                .map_or(GROUP_COMMIT, Duration::from_millis),
+            roll_at: config.u64("segment_bytes").unwrap_or(segment::ROLL_AT),
             last_sync: Instant::now(),
             dirty: false,
+            config_problems: config.problems().to_vec(),
             dir,
         };
         store.load_index(end)?;
@@ -376,7 +414,13 @@ impl Store {
     fn load_index(&mut self, end: Position) -> Result<()> {
         if self.lock.is_none() {
             let mut mem = MemIndex::default();
-            self.replay(&mut mem, Position::default(), end)?;
+            replay(
+                &self.dir,
+                &self.segments,
+                &mut mem,
+                Position::default(),
+                end,
+            )?;
             self.index = Box::new(mem);
             return Ok(());
         }
@@ -395,70 +439,20 @@ impl Store {
             || (self.segments.contains(&pos.segment)
                 && (pos.segment < end.segment
                     || (pos.segment == end.segment && pos.offset <= end.offset)));
-        if !usable || self.replay(&mut disk, pos, end).is_err() {
+        if !usable || replay(&self.dir, &self.segments, &mut disk, pos, end).is_err() {
             drop(disk);
             remove_index(&path)?;
             disk = DiskIndex::open(&path)?.ok_or(Error::Index("can't create the index".into()))?;
-            self.replay(&mut disk, Position::default(), end)?;
+            replay(
+                &self.dir,
+                &self.segments,
+                &mut disk,
+                Position::default(),
+                end,
+            )?;
         }
         disk.persist()?;
         self.index = Box::new(disk);
-        Ok(())
-    }
-
-    /// Applies every record from `from` up to `end` to `index`.
-    fn replay(&self, index: &mut dyn Tables, from: Position, end: Position) -> Result<()> {
-        let mut ord = from.ord;
-        for &id in self.segments.iter().filter(|&&s| s >= from.segment) {
-            let path = self.dir.join("log").join(segment::file_name(id));
-            let bytes = fs::read(&path).map_err(|e| Error::io(&path, e))?;
-            let limit = if id == end.segment {
-                usize::try_from(end.offset).unwrap_or(usize::MAX)
-            } else {
-                bytes.len()
-            };
-            let start = if id == from.segment {
-                usize::try_from(from.offset)
-                    .unwrap_or(usize::MAX)
-                    .max(segment::HEADER_LEN)
-            } else {
-                segment::HEADER_LEN
-            };
-            if bytes.get(..segment::HEADER_LEN) != Some(&segment::header(id)[..]) {
-                return Err(Error::Corrupt {
-                    segment: id,
-                    offset: 0,
-                });
-            }
-            let mut at = start;
-            let mut batch = Vec::new();
-            while at < limit.min(bytes.len()) {
-                let (r, n) = record::decode(&bytes[at..limit]).map_err(|_| Error::Corrupt {
-                    segment: id,
-                    offset: at as u64,
-                })?;
-                batch.push((
-                    VersionId {
-                        segment: id,
-                        offset: at as u64,
-                    },
-                    r,
-                ));
-                at += n;
-            }
-            ord += batch.len() as u64;
-            index.apply(
-                &batch,
-                Position {
-                    segment: id,
-                    offset: at as u64,
-                    ord,
-                },
-            )?;
-            if id == end.segment {
-                break;
-            }
-        }
         Ok(())
     }
 
@@ -481,17 +475,7 @@ impl Store {
     }
 
     fn log_end(&self) -> Result<Position> {
-        let last = *self
-            .segments
-            .last()
-            .ok_or(Error::Layout("manifest lists no segments"))?;
-        let path = self.dir.join("log").join(segment::file_name(last));
-        let bytes = fs::read(&path).map_err(|e| Error::io(&path, e))?;
-        Ok(Position {
-            segment: last,
-            offset: segment::scan(&bytes, last).valid_end,
-            ord: 0,
-        })
+        log_end(&self.dir, &self.segments)
     }
 
     /// Stores a blob (deduplicated) and returns its hash. Durable on return.
@@ -650,10 +634,43 @@ impl Store {
     ///
     /// [`Error::Corrupt`], I/O errors.
     pub fn records(&self) -> Result<Vec<(VersionId, Record)>> {
-        let mut mem = Recorder::default();
-        let end = self.log_end()?;
-        self.replay(&mut mem, Position::default(), end)?;
-        Ok(mem.0)
+        if self.lock.is_some() {
+            let mut mem = Recorder::default();
+            let end = self.log_end()?;
+            replay(
+                &self.dir,
+                &self.segments,
+                &mut mem,
+                Position::default(),
+                end,
+            )?;
+            return Ok(mem.0);
+        }
+        // Lock-less: the log may have been compacted since this handle opened.
+        // Read the manifest afresh, and again if its segments vanish.
+        let mut attempt = 0;
+        loop {
+            let r = read_manifest(&self.dir).and_then(|segments| {
+                let mut mem = Recorder::default();
+                let end = log_end(&self.dir, &segments)?;
+                replay(&self.dir, &segments, &mut mem, Position::default(), end)?;
+                Ok(mem.0)
+            });
+            match r {
+                Err(e) if attempt < READ_RETRIES && e.is_vanished_segment() => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(10 * attempt));
+                }
+                r => return r,
+            }
+        }
+    }
+
+    /// What couldn't be read from `config.toml` when the store was opened
+    /// (defaults are used instead). Empty when the file is fine.
+    #[must_use]
+    pub fn config_problems(&self) -> &[String] {
+        &self.config_problems
     }
 
     /// Disk usage.
@@ -729,6 +746,82 @@ impl Tables for Recorder {
     }
 }
 
+/// Applies every record from `from` up to `end` to `index`.
+fn replay(
+    dir: &Path,
+    segments: &[u64],
+    index: &mut dyn Tables,
+    from: Position,
+    end: Position,
+) -> Result<()> {
+    let mut ord = from.ord;
+    for &id in segments.iter().filter(|&&s| s >= from.segment) {
+        let path = dir.join("log").join(segment::file_name(id));
+        let bytes = fs::read(&path).map_err(|e| Error::io(&path, e))?;
+        let limit = if id == end.segment {
+            usize::try_from(end.offset).unwrap_or(usize::MAX)
+        } else {
+            bytes.len()
+        };
+        let start = if id == from.segment {
+            usize::try_from(from.offset)
+                .unwrap_or(usize::MAX)
+                .max(segment::HEADER_LEN)
+        } else {
+            segment::HEADER_LEN
+        };
+        if bytes.get(..segment::HEADER_LEN) != Some(&segment::header(id)[..]) {
+            return Err(Error::Corrupt {
+                segment: id,
+                offset: 0,
+            });
+        }
+        let mut at = start;
+        let mut batch = Vec::new();
+        while at < limit.min(bytes.len()) {
+            let (r, n) = record::decode(&bytes[at..limit]).map_err(|_| Error::Corrupt {
+                segment: id,
+                offset: at as u64,
+            })?;
+            batch.push((
+                VersionId {
+                    segment: id,
+                    offset: at as u64,
+                },
+                r,
+            ));
+            at += n;
+        }
+        ord += batch.len() as u64;
+        index.apply(
+            &batch,
+            Position {
+                segment: id,
+                offset: at as u64,
+                ord,
+            },
+        )?;
+        if id == end.segment {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Where the valid records of the last of `segments` end.
+fn log_end(dir: &Path, segments: &[u64]) -> Result<Position> {
+    let last = *segments
+        .last()
+        .ok_or(Error::Layout("manifest lists no segments"))?;
+    let path = dir.join("log").join(segment::file_name(last));
+    let bytes = fs::read(&path).map_err(|e| Error::io(&path, e))?;
+    Ok(Position {
+        segment: last,
+        offset: segment::scan(&bytes, last).valid_end,
+        ord: 0,
+    })
+}
+
 fn remove_index(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -737,7 +830,12 @@ fn remove_index(path: &Path) -> Result<()> {
     }
 }
 
-fn take_lock(dir: &Path, mode: Mode) -> Result<Option<File>> {
+/// How often a lock-less reader starts over when a compaction retires the
+/// segments it was reading.
+const READ_RETRIES: u64 = 8;
+
+/// Takes the writer lock, or fails with [`Error::Busy`].
+fn take_lock(dir: &Path) -> Result<File> {
     let path = dir.join("lock");
     let file = OpenOptions::new()
         .create(true)
@@ -746,8 +844,7 @@ fn take_lock(dir: &Path, mode: Mode) -> Result<Option<File>> {
         .open(&path)
         .map_err(|e| Error::io(&path, e))?;
     match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
-        Err(fs::TryLockError::WouldBlock) if mode == Mode::Read => Ok(None),
+        Ok(()) => Ok(file),
         Err(fs::TryLockError::WouldBlock) => Err(Error::Busy),
         Err(fs::TryLockError::Error(e)) => Err(Error::io(&path, e)),
     }
@@ -812,17 +909,9 @@ store_warn_bytes = 1073741824
 patterns = []
 ";
 
-fn read_group_commit(dir: &Path) -> Duration {
-    config_u64(dir, "group_commit_ms").map_or(GROUP_COMMIT, Duration::from_millis)
-}
-
-/// Reads one integer setting from `config.toml` with a line scan; the file is
-/// ours and simple. Unknown or malformed settings fall back to defaults.
+/// Reads one integer setting from `config.toml` (by key, in its FORMAT.md §7
+/// table). `None` when absent or unreadable; [`Config::problems`] says why.
 #[must_use]
 pub fn config_u64(dir: &Path, key: &str) -> Option<u64> {
-    let text = fs::read_to_string(dir.join("config.toml")).ok()?;
-    text.lines().find_map(|l| {
-        let (k, v) = l.split_once('=')?;
-        (k.trim() == key).then(|| v.trim().replace('_', "").parse().ok())?
-    })
+    Config::load(dir).u64(key)
 }

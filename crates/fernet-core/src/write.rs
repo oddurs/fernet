@@ -100,18 +100,57 @@ impl Fernet {
         self.capture(&path)
     }
 
+    /// Creates the real file `name` in the directory `dir` (which must not
+    /// have it yet), then snapshots it. The directory is checked the way
+    /// [`Fernet::write_file`] checks a file: symlinks resolved, inside the
+    /// root, outside the store.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unsupported`] outside the root or inside the store; I/O and
+    /// store errors.
+    pub fn create_file(&self, dir: &Path, name: &std::ffi::OsStr, bytes: &[u8]) -> Result<()> {
+        let dir = self.write_target(dir)?;
+        let path = dir.join(name);
+        if self.in_store(&path) {
+            return Err(self.store_refusal(&path));
+        }
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        replace_file(&path, bytes)?;
+        self.capture(&path)
+    }
+
     /// Where a write to `path` lands: symlinks resolved (replacing the link
-    /// itself would leave the real file unchanged), and inside the root.
-    /// The canonical path is also what the per-file lock is keyed on.
+    /// itself would leave the real file unchanged), inside the root and
+    /// outside the store. The canonical path is also what the per-file lock
+    /// is keyed on.
     fn write_target(&self, path: &Path) -> Result<PathBuf> {
         let real = fs::canonicalize(path).map_err(|e| Error::io(path, e))?;
-        if real.starts_with(self.root()) {
-            Ok(real)
-        } else {
-            Err(Error::Unsupported {
+        if !real.starts_with(self.root()) {
+            return Err(Error::Unsupported {
                 path: self.display(path),
                 message: "it links outside the root; edit the target directly".into(),
-            })
+            });
+        }
+        if self.in_store(&real) {
+            return Err(self.store_refusal(path));
+        }
+        Ok(real)
+    }
+
+    /// Whether the canonical path `real` is the store or inside it.
+    fn in_store(&self, real: &Path) -> bool {
+        real.strip_prefix(self.root())
+            .ok()
+            .and_then(|rel| rel.components().next())
+            .is_some_and(|c| crate::is_store_name(c.as_os_str()))
+    }
+
+    fn store_refusal(&self, path: &Path) -> Error {
+        Error::Unsupported {
+            path: self.display(path),
+            message: "it is inside the store, which fernet never writes through".into(),
         }
     }
 
