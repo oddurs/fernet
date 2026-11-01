@@ -6,6 +6,7 @@
 
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -80,6 +81,10 @@ impl Drop for Mounted {
 }
 
 fn mount(files: &[(&str, &str)]) -> Option<Mounted> {
+    mount_with(files, &[])
+}
+
+fn mount_with(files: &[(&str, &str)], env: &[(&str, &str)]) -> Option<Mounted> {
     if !fuse_available() {
         eprintln!("skipping: FUSE unavailable");
         return None;
@@ -114,6 +119,7 @@ fn mount(files: &[(&str, &str)]) -> Option<Mounted> {
             .arg(&backing)
             .arg(&mnt)
             .arg("--daemon")
+            .envs(env.iter().copied())
             .status()
             .unwrap()
             .success()
@@ -474,4 +480,144 @@ fn replacement_and_edge_cases() {
     // chown is refused, not silently ignored.
     let (ok, _) = sh("chown 12345 o1 2>/dev/null");
     assert!(!ok);
+}
+
+/// Runs a Python snippet in `dir`; returns its stdout, panicking on failure.
+fn py(dir: &Path, code: &str) -> String {
+    let out = Command::new("python3")
+        .arg("-c")
+        .arg(code)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{code}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+#[test]
+fn edge_case_regressions() {
+    let Some(m) = mount(&[
+        ("c.json", "{\"server\": {\"port\": 80}, \"empty\": {}}\n"),
+        ("arr.json", "{\"tags\": [\"a\", \"b\", \"c\"]}\n"),
+        ("n.md", "# A\ntext\n## B\n"),
+        ("f.txt", "one\n"),
+        ("m.txt", "old\n"),
+    ]) else {
+        return;
+    };
+    let (mnt, back) = (&m.mnt, &m.backing);
+    let read = |f: &str| fs::read_to_string(back.join(f)).unwrap();
+
+    // rmdir of a # container is like any directory's: only when empty.
+    let err = fs::remove_dir(mnt.join("c.json#/server")).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(39), "{err}"); // ENOTEMPTY
+    let err = fs::remove_dir(mnt.join("n.md#/A")).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(39), "{err}");
+    fs::remove_dir(mnt.join("n.md#/A/B")).unwrap();
+    fs::remove_dir(mnt.join("c.json#/empty")).unwrap();
+    assert_eq!(read("c.json"), "{\"server\": {\"port\": 80}}\n");
+
+    // A new key unlinked before it's inserted (an editor's swap file) is
+    // never inserted.
+    py(
+        mnt,
+        "import os\n\
+         p='c.json#/server/tmp'\n\
+         fd=os.open(p, os.O_CREAT|os.O_RDWR|os.O_EXCL, 0o600); os.close(fd); os.unlink(p)\n\
+         fd=os.open(p+'2', os.O_CREAT|os.O_RDWR|os.O_EXCL, 0o600); os.unlink(p+'2')\n\
+         os.write(fd, b'x'); os.close(fd)",
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(read("c.json"), "{\"server\": {\"port\": 80}}\n");
+
+    // A handle on an array element doesn't write to its neighbour after a
+    // sibling is removed: the write is refused.
+    py(
+        mnt,
+        "import os, errno\n\
+         fd=os.open('arr.json#/tags/1', os.O_WRONLY|os.O_TRUNC)\n\
+         os.unlink('arr.json#/tags/0'); os.write(fd, b'X')\n\
+         try:\n    os.close(fd); raise SystemExit('close succeeded')\n\
+         except OSError as e:\n    assert e.errno == errno.ESTALE, e",
+    );
+    assert_eq!(read("arr.json"), "{\"tags\": [\"b\", \"c\"]}\n");
+
+    // Lenses are read-only views: removing or renaming one is EROFS.
+    for code in [
+        "os.unlink('f.txt@first')",
+        "os.rename('f.txt@first', 'x')",
+        "os.rmdir('c.json#')",
+    ] {
+        py(
+            mnt,
+            &format!(
+                "import os, errno\ntry:\n    {code}; raise SystemExit('ok')\n\
+                 except OSError as e:\n    assert e.errno == errno.EROFS, e"
+            ),
+        );
+    }
+
+    // fchmod and futimens through an fd act on that fd's file, not on a new
+    // file that has taken its name.
+    py(
+        mnt,
+        "import os\n\
+         fd=os.open('m.txt', os.O_RDWR); os.unlink('m.txt')\n\
+         open('m.txt','w').write('new\\n'); os.chmod('m.txt', 0o644)\n\
+         os.fchmod(fd, 0o600); os.utime(fd, (0, 0)); os.close(fd)",
+    );
+    let meta = fs::metadata(back.join("m.txt")).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o777, 0o644);
+    assert_ne!(meta.modified().unwrap(), std::time::UNIX_EPOCH);
+
+    // mmap of a value works.
+    let out = py(
+        mnt,
+        "import mmap\nf=open('c.json#/server/port','rb')\n\
+         print(mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)[:].decode(), end='')",
+    );
+    assert_eq!(out, "80\n");
+
+    // `@now` follows new versions within the present TTL, not a minute later.
+    fs::write(mnt.join("f.txt"), "two\n").unwrap();
+    m.settle("f.txt", 2);
+    assert_eq!(fs::read_to_string(mnt.join("f.txt@now")).unwrap(), "two\n");
+    fs::write(mnt.join("f.txt"), "three\n").unwrap();
+    m.settle("f.txt", 3);
+    std::thread::sleep(Duration::from_millis(1100));
+    assert_eq!(
+        fs::read_to_string(mnt.join("f.txt@now")).unwrap(),
+        "three\n"
+    );
+}
+
+#[test]
+fn appends_land_at_the_real_end_without_passthrough() {
+    let Some(m) = mount_with(&[("log.txt", "line1\n")], &[("FERNET_NO_PASSTHROUGH", "1")]) else {
+        return;
+    };
+    let (mnt, back) = (&m.mnt, &m.backing);
+    let _ = fs::metadata(mnt.join("log.txt")).unwrap();
+    let _ = fs::read(mnt.join("log.txt")).unwrap();
+    // Appended behind the mount: the kernel's cached size is stale now.
+    fs::OpenOptions::new()
+        .append(true)
+        .open(back.join("log.txt"))
+        .unwrap()
+        .write_all(b"external\n")
+        .unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(mnt.join("log.txt"))
+        .unwrap()
+        .write_all(b"mount\n")
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(back.join("log.txt")).unwrap(),
+        "line1\nexternal\nmount\n"
+    );
 }

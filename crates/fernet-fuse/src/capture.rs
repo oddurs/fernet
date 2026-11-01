@@ -44,29 +44,42 @@ impl Capture {
             .name("fernet-capture".into())
             .spawn(move || {
                 let mut due: HashMap<PathBuf, Instant> = HashMap::new();
+                // Handles one message; true to stop.
+                let handle = |msg: Msg, due: &mut HashMap<PathBuf, Instant>| match msg {
+                    Msg::Touch(p) => {
+                        due.insert(p, Instant::now() + window);
+                        false
+                    }
+                    Msg::Flush(done) => {
+                        for (p, _) in due.drain() {
+                            capture(&f, &p);
+                        }
+                        let _ = f.flush();
+                        let _ = done.send(());
+                        false
+                    }
+                    Msg::Stop => true,
+                };
                 loop {
                     let wait = due.values().min().map_or(Duration::from_secs(3600), |t| {
                         t.saturating_duration_since(Instant::now())
                     });
-                    match rx.recv_timeout(wait) {
-                        Ok(Msg::Touch(p)) => {
-                            due.insert(p, Instant::now() + window);
+                    let mut stop = match rx.recv_timeout(wait) {
+                        Ok(msg) => handle(msg, &mut due),
+                        Err(RecvTimeoutError::Disconnected) => true,
+                        Err(RecvTimeoutError::Timeout) => false,
+                    };
+                    // Take everything queued before scanning `due` again: a
+                    // burst of touches costs one scan, not one each.
+                    while !stop && let Ok(msg) = rx.try_recv() {
+                        stop = handle(msg, &mut due);
+                    }
+                    if stop {
+                        for (p, _) in due.drain() {
+                            capture(&f, &p);
                         }
-                        Ok(Msg::Flush(done)) => {
-                            for (p, _) in due.drain() {
-                                capture(&f, &p);
-                            }
-                            let _ = f.flush();
-                            let _ = done.send(());
-                        }
-                        Ok(Msg::Stop) | Err(RecvTimeoutError::Disconnected) => {
-                            for (p, _) in due.drain() {
-                                capture(&f, &p);
-                            }
-                            let _ = f.flush();
-                            return;
-                        }
-                        Err(RecvTimeoutError::Timeout) => {}
+                        let _ = f.flush();
+                        return;
                     }
                     let now = Instant::now();
                     let ready: Vec<PathBuf> = due
@@ -154,6 +167,22 @@ fn start_watcher(fernet: &Arc<Fernet>, tx: Sender<Msg>) -> Option<notify::Recomm
     let f = Arc::clone(fernet);
     let mut w = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         let Ok(ev) = res else { return };
+        // Opening or reading changes nothing, and capture itself opens
+        // directories: following those events would rescan forever.
+        if matches!(
+            ev.kind,
+            notify::EventKind::Access(
+                notify::event::AccessKind::Open(_)
+                    | notify::event::AccessKind::Read
+                    | notify::event::AccessKind::Close(
+                        notify::event::AccessMode::Read | notify::event::AccessMode::Execute
+                    )
+                    | notify::event::AccessKind::Any
+                    | notify::event::AccessKind::Other
+            )
+        ) {
+            return;
+        }
         for p in ev.paths {
             if !f.ignore().ignored(&p, p.is_dir()) {
                 let _ = tx.send(Msg::Touch(p));

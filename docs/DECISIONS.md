@@ -692,3 +692,29 @@ across `write`/`fsync` syscalls.
 - **CLI**: `fernet write` reads stdin as bytes (real files may be binary;
   values must be UTF-8). Bash completion completes the whole word, including
   `@` and `:`, which are in bash's `COMP_WORDBREAKS`.
+
+## 60. Mount edge cases: empty-only rmdir, stale value handles, moving lenses
+
+**Decision.**
+- `rmdir` on a `#` container works only when it is empty (`ENOTEMPTY`
+  otherwise), like any directory. A Markdown section always lists `body`;
+  an empty body doesn't count.
+- A value handle remembers the value it last saw. If another value sits at
+  its pointer when the write applies (a sibling array element was removed,
+  someone else wrote it), the write is refused with `ESTALE` rather than
+  landing on the neighbour.
+- A key created through the mount and unlinked before it was inserted (an
+  editor's swap file) is dropped, never inserted on release. Insert-on-release
+  and `#` unlinks are serialised so neither falls between the other's steps.
+- Removing or renaming a name that only exists through a lens (`a@first`,
+  `a.json#`) is `EROFS`, not `ENOENT`.
+- Entries for lenses whose meaning moves (`@now`, `@-1h`, `@~1`, marks) get the
+  present TTL; only absolute instants and stamps keep the past one.
+- Real files opened with `O_APPEND` write at the file's real end, not at the
+  offset the kernel computed from a cached size (matters without passthrough).
+- `fchmod` and `futimens` act on the open file even when its path now names
+  another file.
+- `FUSE_DIRECT_IO_ALLOW_MMAP` is requested, so values (direct I/O) can be
+  mmapped on Linux 6.6+.
+- The capture watcher ignores open, read and close-without-write events:
+  capture itself opens directories, and following those rescanned forever.
