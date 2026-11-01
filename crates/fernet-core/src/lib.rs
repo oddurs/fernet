@@ -29,7 +29,7 @@ use jiff::tz::TimeZone;
 pub use cache::TreeCache;
 pub use error::{Error, Result};
 pub use fernet_fs_formats::{NewValue, NodeKind, ScalarType};
-pub use history::{DEFAULT_IGNORES, DEFAULT_MAX_FILE, Ignore, Stratum};
+pub use history::{DEFAULT_IGNORES, DEFAULT_MAX_FILE, Ignore, Stratum, TreeCapture};
 pub use time::Target;
 
 /// The name of the store directory, hidden from listings at the root.

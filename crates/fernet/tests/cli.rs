@@ -529,3 +529,113 @@ fn completion_lets_real_names_and_keys_win() {
     let file = complete("notes.md@");
     assert!(file.contains("notes.md@/") && file.contains("notes.md@~1"));
 }
+
+/// A nested `.fernet` directory that isn't a store is user data: root
+/// discovery keeps walking up to the real store.
+#[test]
+fn a_nested_fernet_directory_does_not_stop_root_discovery() {
+    let tmp = history_fixture();
+    let p = tmp.path();
+    fs::create_dir_all(p.join("sub/.fernet")).unwrap();
+    fs::create_dir_all(p.join("sub/deep")).unwrap();
+    fernet(&p.join("sub/deep"))
+        .args(["cat", "../../notes.md@first"])
+        .assert()
+        .success()
+        .stdout("hello\n");
+}
+
+/// A `config.toml` that doesn't parse is reported, and compaction refuses
+/// rather than applying default retention.
+#[test]
+fn a_broken_config_is_reported() {
+    let tmp = history_fixture();
+    let p = tmp.path();
+    fs::write(
+        p.join(".fernet/config.toml"),
+        "[retention\nsnow_hours = 1\n",
+    )
+    .unwrap();
+    fernet(p)
+        .arg("log")
+        .assert()
+        .success()
+        .stderr(predicate_contains("config.toml is not valid toml"));
+    fernet(p)
+        .arg("compact")
+        .assert()
+        .code(5)
+        .stderr(predicate_contains("config.toml is not valid toml"));
+    // Completion stays quiet.
+    fernet(p)
+        .args(["complete", "no"])
+        .assert()
+        .success()
+        .stderr("");
+}
+
+/// An unreadable file doesn't abort init: it's skipped with a warning.
+#[test]
+fn init_skips_unreadable_files() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    fs::write(p.join("a.txt"), "a").unwrap();
+    fs::write(p.join("secret.txt"), "s").unwrap();
+    fs::set_permissions(p.join("secret.txt"), fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(p.join("secret.txt")).is_ok() {
+        return; // Running as root: permissions don't apply.
+    }
+    fernet(p)
+        .arg("init")
+        .assert()
+        .success()
+        .stdout(predicate_contains("(1 file captured)"))
+        .stderr(predicate_contains("skipped secret.txt"));
+    fernet(p).args(["cat", "a.txt@first"]).assert().success();
+}
+
+/// The watcher never follows symlinks to directories and applies ignore
+/// rules as the initial walk does.
+#[test]
+fn watch_ignores_symlinked_directories_and_reincluded_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(p.join(".fernetignore"), "logs/\n!logs/keep.txt\n").unwrap();
+    fs::create_dir(p.join("logs")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), p.join("out")).unwrap();
+    std::os::unix::fs::symlink(".", p.join("self")).unwrap();
+    fernet(p).arg("init").assert().success();
+    let bin = assert_cmd::cargo::cargo_bin("fernet");
+    let mut child = std::process::Command::new(bin)
+        .arg("watch")
+        .current_dir(p)
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    fs::write(outside.path().join("secret.txt"), "s").unwrap();
+    fs::write(p.join("logs/keep.txt"), "k").unwrap();
+    fs::write(p.join("a.txt"), "a").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut log = String::new();
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let out = fernet(p).arg("log").output().unwrap();
+        log = String::from_utf8_lossy(&out.stdout).into_owned();
+        if log.contains("a.txt") {
+            break;
+        }
+    }
+    // Give stragglers from the same batch a moment.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let out = fernet(p).arg("log").output().unwrap();
+    child.kill().unwrap();
+    let _ = child.wait();
+    let final_log = String::from_utf8_lossy(&out.stdout);
+    assert!(log.contains("a.txt"), "watcher didn't capture a.txt: {log}");
+    for bad in ["secret.txt", "keep.txt", "self/", "out/", "MANIFEST"] {
+        assert!(!final_log.contains(bad), "{bad} captured:\n{final_log}");
+    }
+}

@@ -151,7 +151,8 @@ impl Capture {
 }
 
 fn capture(f: &Fernet, path: &Path) {
-    let res = if path.is_dir() {
+    // Symlinks are never followed: a link to a directory is not a directory.
+    let res = if is_real_dir(path) {
         f.snapshot_tree(path).map(|_| ())
     } else {
         f.snapshot(path).map(|_| ())
@@ -161,34 +162,42 @@ fn capture(f: &Fernet, path: &Path) {
     }
 }
 
+fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+}
+
 /// A watcher that feeds changes made outside the mount into the debouncer.
 fn start_watcher(fernet: &Arc<Fernet>, tx: Sender<Msg>) -> Option<notify::RecommendedWatcher> {
     use notify::Watcher;
     let f = Arc::clone(fernet);
-    let mut w = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        let Ok(ev) = res else { return };
-        // Opening or reading changes nothing, and capture itself opens
-        // directories: following those events would rescan forever.
-        if matches!(
-            ev.kind,
-            notify::EventKind::Access(
-                notify::event::AccessKind::Open(_)
-                    | notify::event::AccessKind::Read
-                    | notify::event::AccessKind::Close(
-                        notify::event::AccessMode::Read | notify::event::AccessMode::Execute
-                    )
-                    | notify::event::AccessKind::Any
-                    | notify::event::AccessKind::Other
-            )
-        ) {
-            return;
-        }
-        for p in ev.paths {
-            if !f.ignore().ignored(&p, p.is_dir()) {
-                let _ = tx.send(Msg::Touch(p));
+    let mut w = notify::RecommendedWatcher::new(
+        move |res: notify::Result<notify::Event>| {
+            let Ok(ev) = res else { return };
+            // Opening or reading changes nothing, and capture itself opens
+            // directories: following those events would rescan forever.
+            if matches!(
+                ev.kind,
+                notify::EventKind::Access(
+                    notify::event::AccessKind::Open(_)
+                        | notify::event::AccessKind::Read
+                        | notify::event::AccessKind::Close(
+                            notify::event::AccessMode::Read | notify::event::AccessMode::Execute
+                        )
+                        | notify::event::AccessKind::Any
+                        | notify::event::AccessKind::Other
+                )
+            ) {
+                return;
             }
-        }
-    })
+            for p in ev.paths {
+                if !f.ignore().ignored(&p, is_real_dir(&p)) {
+                    let _ = tx.send(Msg::Touch(p));
+                }
+            }
+        },
+        // Never follow symlinks: they may lead outside the root or into the store.
+        notify::Config::default().with_follow_symlinks(false),
+    )
     .ok()?;
     w.watch(fernet.root(), notify::RecursiveMode::Recursive)
         .ok()?;

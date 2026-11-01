@@ -1,8 +1,8 @@
 //! Output style: lowercase, quiet and exact. Colour only on a TTY, and
 //! `NO_COLOR` is respected.
 
+use jiff::Timestamp;
 use jiff::tz::TimeZone;
-use jiff::{Timestamp, Unit};
 
 /// Whether to use colour on stdout.
 pub(crate) fn colour(tty: bool) -> bool {
@@ -49,12 +49,13 @@ fn short_date(t: Timestamp, now: Timestamp, tz: &TimeZone) -> String {
 }
 
 /// A full local timestamp, for `fernet log`: `2026-10-30 16:45:12`.
+/// Truncated to the second, like version names: a time copied from the log
+/// and used as `@time` names this version, never the one before it.
 pub(crate) fn stamp(nanos: i64, tz: &TimeZone) -> String {
     let t = fernet_fs_core::time::timestamp(nanos);
-    t.to_zoned(tz.clone()).round(Unit::Second).map_or_else(
-        |_| t.to_string(),
-        |z| z.strftime("%Y-%m-%d %H:%M:%S").to_string(),
-    )
+    t.to_zoned(tz.clone())
+        .strftime("%Y-%m-%d %H:%M:%S")
+        .to_string()
 }
 
 /// Human sizes: `512 b`, `1.2 kib`, `3.4 mib`.
@@ -84,5 +85,10 @@ mod tests {
         assert_eq!(when(n("2025-10-28T09:00:00Z"), now, &tz), "oct 28 2025");
         assert_eq!(size(2048), "2.0 kib");
         assert_eq!(tephra("x"), "──────────── tephra · x ────────────");
+        // Truncated, never rounded up past the version's instant.
+        let late = n("2026-10-30T15:59:15Z") + 999_000_000;
+        assert_eq!(stamp(late, &tz), "2026-10-30 15:59:15");
+        let before_epoch = n("1969-12-31T23:59:59Z") + 600_000_000;
+        assert_eq!(stamp(before_epoch, &tz), "1969-12-31 23:59:59");
     }
 }

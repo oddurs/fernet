@@ -520,3 +520,182 @@ fn compaction_failure_after_commit_keeps_the_index_honest() {
         s.read(v).unwrap();
     }
 }
+
+const HOUR_NS: i64 = 3_600 * 1_000_000_000;
+
+fn delete(store: &mut Store, path: &str, time: i64) {
+    store
+        .append(&Record {
+            kind: Kind::Delete,
+            time,
+            path: path.into(),
+            hash: Hash::ZERO,
+            size: 0,
+            extra: String::new(),
+        })
+        .unwrap();
+}
+
+/// Edited twice then deleted within one hour bucket: compaction keeps the
+/// tombstone and the last content before it, and that blob.
+#[test]
+fn compaction_keeps_a_deleted_files_last_content() {
+    use fernet_fs_store::compact::Policy;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Store::init(tmp.path()).unwrap();
+    let now = 1000 * HOUR_NS;
+    let hour = now - 30 * HOUR_NS;
+    write(&mut s, "notes.md", b"draft", hour + 60 * 1_000_000_000);
+    write(&mut s, "notes.md", b"final", hour + 20 * 60 * 1_000_000_000);
+    delete(&mut s, "notes.md", hour + 40 * 60 * 1_000_000_000);
+    s.compact_with(now, &Policy::default(), false, None)
+        .unwrap();
+    let versions = s.versions("notes.md").unwrap();
+    assert_eq!(versions.len(), 2, "{versions:?}");
+    assert_eq!(s.read(&versions[0]).unwrap(), b"final");
+    assert!(versions[1].hash.is_none());
+    drop(s);
+    assert!(verify(tmp.path()).unwrap().ok());
+}
+
+/// Readers never take the writer lock: a reader open doesn't make writers
+/// busy, and the reader leaves no trace in the store.
+#[test]
+fn readers_dont_take_the_lock() {
+    let tmp = store_with(3);
+    let _ = fs::remove_file(tmp.path().join(".fernet/lock"));
+    let r = Store::open(tmp.path(), Mode::Read).unwrap();
+    assert!(!tmp.path().join(".fernet/lock").exists());
+    let mut w = Store::open(tmp.path(), Mode::Write).unwrap();
+    let r2 = Store::open(tmp.path(), Mode::Read).unwrap();
+    write(&mut w, "new", b"x", 99_000);
+    w.flush().unwrap();
+    assert_eq!(r.records().unwrap().len(), 4);
+    assert_eq!(r2.records().unwrap().len(), 4);
+}
+
+fn set_writable(path: &Path, writable: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    if path.is_dir() {
+        for e in fs::read_dir(path).unwrap() {
+            set_writable(&e.unwrap().path(), writable);
+        }
+    }
+    let mode = fs::metadata(path).unwrap().permissions().mode();
+    let mode = if writable {
+        mode | 0o200
+    } else {
+        mode & !0o222
+    };
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// A read-only store can be read (`chmod -R a-w .fernet`).
+#[test]
+fn a_read_only_store_can_be_read() {
+    let tmp = store_with(3);
+    let dir = tmp.path().join(".fernet");
+    let _ = fs::remove_file(dir.join("lock"));
+    set_writable(&dir, false);
+    let res = Store::open(tmp.path(), Mode::Read).and_then(|s| s.records());
+    set_writable(&dir, true);
+    assert_eq!(res.unwrap().len(), 3);
+}
+
+/// A lock-less reader opened before a compaction still reads the log after
+/// it, and readers opening while compactions run never see a vanished
+/// segment.
+#[test]
+fn readers_survive_compaction() {
+    use fernet_fs_store::compact::Policy;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut w = Store::init(tmp.path()).unwrap();
+    let now = 10_000 * HOUR_NS;
+    let mut t = 0;
+    let mut fill = |w: &mut Store| {
+        for i in 0..100 {
+            t += 1_000_000_000;
+            write(w, "a", format!("v{t}-{i}").as_bytes(), t);
+        }
+        w.flush().unwrap();
+    };
+    fill(&mut w);
+    let early = Store::open(tmp.path(), Mode::Read).unwrap();
+    w.compact_with(now, &Policy::default(), false, None)
+        .unwrap();
+    assert_eq!(early.records().unwrap().len(), 1);
+
+    let root = tmp.path().to_owned();
+    let stop = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let stop = Arc::clone(&stop);
+            let root = root.clone();
+            std::thread::spawn(move || {
+                let mut opens = 0;
+                while !stop.load(Ordering::SeqCst) {
+                    let s = Store::open(&root, Mode::Read).unwrap();
+                    s.records().unwrap();
+                    opens += 1;
+                }
+                opens
+            })
+        })
+        .collect();
+    for _ in 0..15 {
+        fill(&mut w);
+        w.compact_with(now, &Policy::default(), false, None)
+            .unwrap();
+    }
+    stop.store(true, Ordering::SeqCst);
+    for r in readers {
+        assert!(r.join().unwrap() > 0);
+    }
+}
+
+/// A damaged blob is rewritten when the same content is stored again.
+#[test]
+fn putting_a_damaged_blob_repairs_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Store::init(tmp.path()).unwrap();
+    write(&mut s, "a", b"hello", 1);
+    let hex = Hash::of(b"hello").to_hex();
+    let blob = tmp
+        .path()
+        .join(".fernet/objects")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    fs::write(&blob, b"garbage").unwrap();
+    let v = s.version_at("a", 1).unwrap().unwrap();
+    assert!(s.read(&v).is_err());
+    write(&mut s, "b", b"hello", 2);
+    assert_eq!(s.read(&v).unwrap(), b"hello");
+}
+
+/// `config.toml` is TOML: comments, other quote styles and multi-line
+/// arrays are read, and a broken file stops compaction instead of silently
+/// applying the defaults.
+#[test]
+fn config_is_parsed_as_toml() {
+    use fernet_fs_store::compact::Policy;
+    let tmp = store_with(1);
+    let dir = tmp.path().join(".fernet");
+    let config = dir.join("config.toml");
+    let text = fs::read_to_string(&config)
+        .unwrap()
+        .replace("snow_hours = 24", "snow_hours = 168  # a week");
+    fs::write(&config, text).unwrap();
+    assert_eq!(fernet_fs_store::config_u64(&dir, "snow_hours"), Some(168));
+    assert_eq!(Policy::load(&dir).unwrap().snow, 168 * HOUR_NS);
+
+    fs::write(&config, "[retention\nsnow_hours = 168\n").unwrap();
+    let mut s = Store::open(tmp.path(), Mode::Write).unwrap();
+    assert_eq!(s.config_problems().len(), 1);
+    assert!(matches!(
+        s.compact(i64::MAX / 2, false),
+        Err(fernet_fs_store::Error::Config(_))
+    ));
+    assert_eq!(s.records().unwrap().len(), 1);
+}
