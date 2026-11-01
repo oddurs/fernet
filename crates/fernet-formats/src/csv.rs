@@ -212,6 +212,13 @@ impl Driver for Csv {
                     .into_iter()
                     .next()
                     .map_or(0, |h| h.fields.len());
+                // With no header there are no columns, and a new line would
+                // become the header, not a row.
+                if header == 0 {
+                    return Err(DriverError::Unsupported(
+                        "this csv file has no header row; write one first",
+                    ));
+                }
                 let newline = if s.contains("\r\n") { "\r\n" } else { "\n" };
                 let lead = if s.is_empty() || s.ends_with('\n') {
                     ""
@@ -224,7 +231,14 @@ impl Driver for Csv {
                 } else {
                     ",".repeat(header.saturating_sub(1))
                 };
-                crate::replace(src, src.len()..src.len(), &format!("{lead}{row}{newline}"))
+                let out =
+                    crate::replace(src, src.len()..src.len(), &format!("{lead}{row}{newline}"));
+                // The new row must be there (blank lines are no rows).
+                let after = self.parse(&out)?;
+                if after.node(after.root).children.len() != node.children.len() + 1 {
+                    return Err(DriverError::Unsupported("can't add a row to this csv file"));
+                }
+                out
             }
             Edit::Remove => {
                 if ptr.len() != 1 {

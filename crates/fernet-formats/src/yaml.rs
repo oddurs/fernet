@@ -78,9 +78,15 @@ impl Driver for Yaml {
             ));
         }
         let text = crate::strip_newline(&text);
-        let literal = match ty {
-            ScalarType::String | ScalarType::Text => string_literal(old, text),
-            _ if core_schema(text) == ty => text.to_owned(),
+        let (literal, ty) = match ty {
+            ScalarType::String | ScalarType::Text => (string_literal(old, text), ty),
+            // A null is a value not filled in yet: it takes any value, typed
+            // by the core schema like any plain scalar.
+            ScalarType::Null => match core_schema(text) {
+                ScalarType::String => (string_literal(old, text), ScalarType::String),
+                new_ty => (text.to_owned(), new_ty),
+            },
+            _ if core_schema(text) == ty => (text.to_owned(), ty),
             _ => {
                 return Err(DriverError::InvalidValue(format!(
                     "{text:?} isn't a yaml {}",
@@ -88,7 +94,26 @@ impl Driver for Yaml {
                 )));
             }
         };
-        let out = crate::replace(src, node.value_span.clone(), &literal);
+        // Into an empty value: `name:` needs a space after its colon, and
+        // a comment right after it needs one before.
+        let bytes = s.as_bytes();
+        let span = node.value_span.clone();
+        let literal = if span.is_empty() && !literal.is_empty() {
+            let lead = if span.start > 0 && bytes[span.start - 1] == b':' {
+                " "
+            } else {
+                ""
+            };
+            let trail = if bytes.get(span.end) == Some(&b'#') {
+                " "
+            } else {
+                ""
+            };
+            format!("{lead}{literal}{trail}")
+        } else {
+            literal
+        };
+        let out = crate::replace(src, span, &literal);
         crate::check_scalar(self, &out, ptr, ty, text)?;
         Ok(out)
     }
@@ -216,7 +241,17 @@ impl<'s> Build<'s> {
             }
             Some(Key::Named(key, key_span)) => {
                 if !alias {
+                    let src = self.src;
                     let node = self.b.node_mut(id);
+                    // An empty value (`name:`) gets a span at the key; put it
+                    // after the `:` and any spaces, where a value would go.
+                    if node.value_span.is_empty()
+                        && matches!(node.kind, NodeKind::Scalar(_))
+                        && node.value_span.start <= key_span.end
+                        && let Some(at) = empty_value_at(src, key_span.end)
+                    {
+                        node.value_span = at..at;
+                    }
                     node.span = key_span.start..node.value_span.end.max(key_span.end);
                     node.key_span = Some(key_span);
                 }
@@ -384,15 +419,44 @@ impl<'s> Build<'s> {
     }
 }
 
-/// True if the token just before `at` (on the same line) is an `&anchor` or
-/// `!tag` property.
+/// Where an empty mapping value goes: after the `:` that follows the key
+/// ending at `key_end` (closing quote included), and any spaces or tabs.
+fn empty_value_at(s: &str, key_end: usize) -> Option<usize> {
+    let rest = s.get(key_end..)?;
+    let colon = key_end + rest.len() - rest.trim_start_matches([' ', '\t']).len();
+    if s.as_bytes().get(colon) != Some(&b':') {
+        return None;
+    }
+    let after = &s[colon + 1..];
+    Some(colon + 1 + after.len() - after.trim_start_matches([' ', '\t']).len())
+}
+
+/// True if the token just before `at` (on the same line, or on the lines
+/// above when only whitespace and comments are between) is an `&anchor` or
+/// `!tag` property. Comments are skipped, so a `!` or `&` in one doesn't count.
 fn has_properties(s: &str, at: usize) -> bool {
-    // Properties may sit on the line above (`a: !!binary` then the value).
-    let before = s[..at].trim_end_matches([' ', '\t', '\n', '\r']);
-    let token_start = before
-        .rfind([' ', '\t', '\n', ':', '-', '[', '{', ','])
-        .map_or(0, |i| i + 1);
-    before[token_start..].starts_with(['&', '!'])
+    let mut before = &s[..at];
+    loop {
+        // Properties may sit on the line above (`a: !!binary` then the value).
+        let trimmed = before.trim_end_matches([' ', '\t', '\n', '\r']);
+        let line_start = trimmed.rfind('\n').map_or(0, |i| i + 1);
+        let line = &trimmed[line_start..];
+        // A comment starts with `#` at the line's start or after a space.
+        let comment = line
+            .char_indices()
+            .find(|&(i, c)| c == '#' && (i == 0 || line[..i].ends_with([' ', '\t'])))
+            .map(|(i, _)| i);
+        let Some(cut) = comment else {
+            let token_start = line
+                .rfind([' ', '\t', ':', '-', '[', '{', ','])
+                .map_or(0, |i| i + 1);
+            return line[token_start..].starts_with(['&', '!']);
+        };
+        before = &trimmed[..line_start + cut];
+        if before.is_empty() {
+            return false;
+        }
+    }
 }
 
 /// True if `text` can be written as a plain scalar and read back as the same
