@@ -871,3 +871,18 @@ fn yaml_edge_case_regressions() {
     assert!(set(&Yaml, "a: !!str # c\n  x\n", "a", "y").is_err());
     assert!(set(&Yaml, "a: &x # c\n  1\n", "a", "2").is_err());
 }
+
+/// Edge cases in the CSV driver.
+#[test]
+fn csv_edge_case_regressions() {
+    use fernet_fs_formats::Csv;
+    // An empty file has no header, so no columns: a new row is refused.
+    assert!(matches!(
+        ins(&Csv, "", "", "0", NewValue::EmptyObject),
+        Err(DriverError::Unsupported(_))
+    ));
+    // With a header it works, and the row is there.
+    let out = ins(&Csv, "a,b\n", "", "0", NewValue::EmptyObject).unwrap();
+    assert_eq!(out, "a,b\n,\n");
+    assert!(value_at(&Csv, &out, "0/b").is_some());
+}
