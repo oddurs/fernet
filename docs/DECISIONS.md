@@ -690,3 +690,49 @@ across `write`/`fsync` syscalls.
 - **CLI**: `fernet write` reads stdin as bytes (real files may be binary;
   values must be UTF-8). Bash completion completes the whole word, including
   `@` and `:`, which are in bash's `COMP_WORDBREAKS`.
+
+## 59. Format edge cases: what's fixed and what's refused
+
+**Decision.**
+- **TOML inserts and removes keep every untouched line's bytes.** After
+  `toml_edit` prints the edited document, its lines are lined up with the
+  original's (longest common subsequence, after trimming the shared head and
+  tail) and every line that lines up is copied from the original with its own
+  line ending. New lines get the file's usual ending (CRLF if most lines use
+  it). So a file that mixes CRLF and LF, even inside a multi-line string, keeps
+  both. The result must parse to exactly what `toml_edit` printed. The reorder
+  guard (entry 58) compares lines as a multiset, so duplicate lines
+  (`enabled = true` in two tables, repeated `[[p]]` headers) don't make it
+  refuse; a real reorder still does. An edit whose changed middle is huge (more
+  than about 4M line pairs) is refused rather than diffed.
+- **New TOML text** is a typed value only if it is exactly one TOML value
+  (`toml_edit`'s `Value` parser: no surrounding space, no comment, nothing
+  after it); anything else, like `1\nc = 2` or `5 # five`, is stored as a
+  string. This is JSON's rule (entry 37); TOML also keeps arrays and inline
+  tables.
+- **Refused in TOML:** inserting into or removing from an array whose elements
+  carry comments (`toml_edit` keeps a comment in the next element's prefix, so
+  it would land on the wrong element), and removing the only table of an array
+  of tables (it would print as nothing and the key would vanish; remove the
+  array instead).
+- **Markdown:** YAML front matter (`---` … `---` at the start) is a metadata
+  block in the root body, not a thematic break and a setext heading. A
+  multi-line setext heading's line break reads as a space. `rm body` is checked
+  like a write: emptying a body that holds a link reference definition a
+  heading uses is refused. Writing an empty body back as read is
+  byte-identical (no added newline).
+- **YAML:** an empty value (`name:`) spans the spot after its colon and
+  spaces, so it can be written; a space is added after a bare `:` and before
+  a following comment. A null (`name:`, `~`, `null`) is a value not filled in
+  yet and takes any value, typed by the core schema like any plain scalar
+  (an exception to entry 36). A `!` or `&` inside a comment isn't a tag or
+  anchor.
+- **SQLite:** rows without a single-column primary key are keyed by the first
+  of `rowid`, `_rowid_`, `oid` that no column shadows, else by position. Keys
+  that come out the same (`1` and `'1'`, two blobs of one size, a text key
+  that reads `(null 3)`) are told apart: the first row in table order keeps
+  the key, later ones get ` (2)`, ` (3)`…, skipping any name a row already
+  has. No row is dropped. REALs show as the shortest text that reads back as
+  the same REAL (`1.0`, `1e300`, `1e-7`).
+- **CSV:** adding a row to a file with no header row is refused; every new
+  row is checked to parse as one.
