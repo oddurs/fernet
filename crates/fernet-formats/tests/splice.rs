@@ -819,3 +819,55 @@ fn markdown_edge_case_regressions() {
     // A multi-line setext heading keeps its line break as a space.
     assert_eq!(keys("Foo\nbar\n===\n"), ["body", "Foo bar"]);
 }
+
+/// Edge cases in the YAML driver.
+#[test]
+fn yaml_edge_case_regressions() {
+    // An empty value can be written, after its colon; a null takes any type.
+    let src = "name:\nport: 80\n";
+    assert_eq!(set(&Yaml, src, "name", "5").unwrap(), "name: 5\nport: 80\n");
+    assert_eq!(
+        set(&Yaml, src, "name", "api").unwrap(),
+        "name: api\nport: 80\n"
+    );
+    assert_eq!(
+        set(&Yaml, src, "name", "true").unwrap(),
+        "name: true\nport: 80\n"
+    );
+    assert_eq!(
+        set(&Yaml, src, "name", "a: b").unwrap(),
+        "name: \"a: b\"\nport: 80\n"
+    );
+    assert_eq!(set(&Yaml, src, "name", "").unwrap(), src);
+    assert_eq!(set(&Yaml, "a: \nb: 1\n", "a", "x").unwrap(), "a: x\nb: 1\n");
+    assert_eq!(
+        set(&Yaml, "a: # note\nb: 1\n", "a", "x").unwrap(),
+        "a: x # note\nb: 1\n"
+    );
+    assert_eq!(
+        set(&Yaml, "\"q\":\nb: 1\n", "q", "1").unwrap(),
+        "\"q\": 1\nb: 1\n"
+    );
+    assert_eq!(
+        set(&Yaml, "{a: , b: 1}\n", "a", "2").unwrap(),
+        "{a: 2, b: 1}\n"
+    );
+    assert_eq!(set(&Yaml, "a: ~\n", "a", "7").unwrap(), "a: 7\n");
+    // ... but other types still keep theirs.
+    assert!(matches!(
+        set(&Yaml, src, "port", "x"),
+        Err(DriverError::InvalidValue(_))
+    ));
+    // `!` or `&` in a comment isn't a tag or anchor.
+    assert_eq!(
+        set(&Yaml, "a: # see !this & that\n  1\n", "a", "2").unwrap(),
+        "a: # see !this & that\n  2\n"
+    );
+    assert_eq!(
+        set(&Yaml, "a: 1 # !x\nb: 2\n", "b", "3").unwrap(),
+        "a: 1 # !x\nb: 3\n"
+    );
+    // Real properties are still read-only, comments or not.
+    assert!(set(&Yaml, "a: !!str # c\n  x\n", "a", "y").is_err());
+    assert!(set(&Yaml, "a: &x # c\n  1\n", "a", "2").is_err());
+}
