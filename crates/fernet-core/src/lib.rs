@@ -388,7 +388,10 @@ impl Fernet {
                 _ => Err(Error::OutsideRoot { path: "..".into() }),
             };
         }
-        if dir == self.root && is_store_name(name) {
+        // The store is hidden, also behind a symlink to the root.
+        if is_store_name(name)
+            && (dir == self.root || fs::canonicalize(dir).is_ok_and(|d| d == self.root))
+        {
             return Ok(Resolved::Missing);
         }
         let real = dir.join(name);
@@ -466,6 +469,16 @@ impl Fernet {
             },
             None => Resolved::Missing,
         };
+        let target = match target {
+            Target::Second(s) => {
+                let end = s.saturating_add(999_999_999);
+                if let Some(v) = kept.iter().find(|v| v.time >= s && v.time <= end) {
+                    return Ok(file(Some(v)));
+                }
+                Target::At(end)
+            }
+            t => t,
+        };
         Ok(match target {
             Target::At(t) => match history::entry_at(&store, path, &rel, t)? {
                 // The file has history, but none that early: say so.
@@ -494,6 +507,7 @@ impl Fernet {
             Target::Listing => Resolved::VersionListing {
                 path: path.to_owned(),
             },
+            Target::Second(_) => Resolved::Missing,
         })
     }
 
@@ -657,15 +671,33 @@ impl Fernet {
                 _ => None,
             })
             .collect();
-        if parts.len() < root_parts.len() || parts[..root_parts.len()] != root_parts[..] {
-            return Err(Error::OutsideRoot {
-                path: arg.to_string_lossy().into_owned(),
-            });
+        if parts.len() >= root_parts.len() && parts[..root_parts.len()] == root_parts[..] {
+            return Ok(parts[root_parts.len()..]
+                .iter()
+                .map(|p| (*p).to_owned())
+                .collect());
         }
-        Ok(parts[root_parts.len()..]
-            .iter()
-            .map(|p| (*p).to_owned())
-            .collect())
+        // The path may reach the root through a symlink (`/tmp` on macOS, a
+        // linked checkout): the shortest existing prefix that leads into the
+        // root decides. The last name stays as typed, so a link there is
+        // still the link.
+        let mut prefix = PathBuf::from("/");
+        for (k, part) in parts.iter().enumerate().take(parts.len().saturating_sub(1)) {
+            prefix.push(part);
+            let Ok(real) = fs::canonicalize(&prefix) else {
+                break;
+            };
+            if let Ok(inside) = real.strip_prefix(&self.root) {
+                return Ok(inside
+                    .iter()
+                    .chain(parts[k + 1..].iter().copied())
+                    .map(OsStr::to_owned)
+                    .collect());
+            }
+        }
+        Err(Error::OutsideRoot {
+            path: arg.to_string_lossy().into_owned(),
+        })
     }
 
     /// Resolves a path given the way a user types it on the command line.

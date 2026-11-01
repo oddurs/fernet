@@ -394,3 +394,138 @@ fn write_takes_binary_stdin_for_files() {
         .assert()
         .code(3);
 }
+
+#[test]
+#[cfg(unix)]
+fn writes_stay_in_the_root_and_out_of_the_store() {
+    use std::os::unix::fs::symlink;
+    let outer = tempfile::tempdir().unwrap();
+    let p = outer.path().join("root");
+    fs::create_dir(&p).unwrap();
+    fs::write(p.join("notes.txt"), "v1\n").unwrap();
+    fs::create_dir(p.join("sub")).unwrap();
+    fernet(&p).arg("init").assert().success();
+    fs::create_dir(outer.path().join("outside")).unwrap();
+    symlink("../outside", p.join("out")).unwrap();
+    symlink(".", p.join("self")).unwrap();
+    symlink(".fernet/MANIFEST", p.join("mlink")).unwrap();
+    let manifest = fs::read(p.join(".fernet/MANIFEST")).unwrap();
+
+    // New files through a link out of the root, or into the store: refused.
+    for path in ["out/new", "mlink"] {
+        fernet(&p).args(["write", path, "x"]).assert().code(3);
+    }
+    // Behind a link to the root, the store is hidden: not found.
+    for path in ["self/.fernet/new", "self/.fernet/MANIFEST"] {
+        fernet(&p).args(["write", path, "x"]).assert().code(1);
+    }
+    assert!(!outer.path().join("outside/new").exists());
+    assert!(!p.join(".fernet/new").exists());
+    assert_eq!(fs::read(p.join(".fernet/MANIFEST")).unwrap(), manifest);
+    // The store stays hidden behind a link to the root.
+    fernet(&p).args(["ls", "self/.fernet"]).assert().code(1);
+    fernet(&p).arg("verify").assert().success();
+
+    // A lens that finds nothing never becomes a file; the past is read-only.
+    for path in [
+        "notes.txt@~5",
+        "sub@~1",
+        "sub@first/new.txt",
+        "notes.txt@/new",
+    ] {
+        fernet(&p).args(["write", path, "x"]).assert().code(4);
+    }
+    fernet(&p)
+        .args(["write", "notes.txt#", "x"])
+        .assert()
+        .code(3);
+    let names: Vec<_> = fs::read_dir(&p)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.contains(['@', '#']))
+        .collect();
+    assert!(names.is_empty(), "{names:?}");
+    // Names that only look like lenses are still plain files.
+    fernet(&p)
+        .args(["write", "user@example.com", "x"])
+        .assert()
+        .success();
+    assert!(p.join("user@example.com").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn paths_through_a_linked_root() {
+    let outer = tempfile::tempdir().unwrap();
+    let p = outer.path().join("root");
+    fs::create_dir(&p).unwrap();
+    fs::write(p.join("notes.txt"), "hi\n").unwrap();
+    fernet(&p).arg("init").assert().success();
+    std::os::unix::fs::symlink("root", outer.path().join("link")).unwrap();
+    let abs = outer.path().join("link/notes.txt");
+    fernet(&p)
+        .arg("cat")
+        .arg(&abs)
+        .assert()
+        .success()
+        .stdout("hi\n");
+    fernet(outer.path())
+        .args(["--root", "link", "cat", "link/notes.txt"])
+        .assert()
+        .success()
+        .stdout("hi\n");
+}
+
+#[test]
+fn a_stamp_selects_its_listing_entry() {
+    let tmp = history_fixture();
+    let p = tmp.path();
+    for v in ["v2", "v3", "v4"] {
+        fernet(p).args(["write", "notes.md", v]).assert().success();
+    }
+    let out = fernet(p).args(["ls", "notes.md@"]).output().unwrap();
+    let listing = String::from_utf8(out.stdout).unwrap();
+    for name in listing.lines() {
+        let by_listing = fernet(p)
+            .arg("cat")
+            .arg(format!("notes.md@/{name}"))
+            .output()
+            .unwrap()
+            .stdout;
+        if name.contains('.') {
+            continue; // `.N` names are listing-only
+        }
+        let by_stamp = fernet(p)
+            .arg("cat")
+            .arg(format!("notes.md@{name}"))
+            .output()
+            .unwrap()
+            .stdout;
+        assert_eq!(by_stamp, by_listing, "{name}");
+    }
+    fernet(p)
+        .args(["cat", "notes.md@9999-12-31"])
+        .assert()
+        .success()
+        .stdout("v4");
+}
+
+#[test]
+fn completion_lets_real_names_and_keys_win() {
+    let tmp = history_fixture();
+    let p = tmp.path();
+    fs::write(p.join("user@example.com"), "x").unwrap();
+    fs::write(p.join("e.json"), r#"{"emails":{"a@b.com":1,"x#":2}}"#).unwrap();
+    fs::create_dir(p.join("sub")).unwrap();
+    let complete = |word: &str| {
+        let out = fernet(p).args(["complete", "--", word]).output().unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert_eq!(complete("user@ex"), "user@example.com\n");
+    assert_eq!(complete("e.json#/emails/a@"), "e.json#/emails/a@b.com\n");
+    assert_eq!(complete("e.json#/emails/x#"), "e.json#/emails/x#\n");
+    let dir = complete("sub@");
+    assert!(dir.contains("sub@first") && !dir.contains("sub@/") && !dir.contains("sub@~1"));
+    let file = complete("notes.md@");
+    assert!(file.contains("notes.md@/") && file.contains("notes.md@~1"));
+}

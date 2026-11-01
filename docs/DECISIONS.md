@@ -591,9 +591,11 @@ but those names didn't work after `@`, and `now` was reserved without meaning
 anything.
 
 **Decision.** Two grammar forms. `@now` is the present (the latest version, as
-an `@` path, so read-only). `@YYYYMMDDTHHMMSSZ` is a UTC second and resolves to
-the end of that second, so the version a listing shows under that name is
-always selected. Both are canonical-only, like every spec (DECISIONS 7).
+an `@` path, so read-only). `@YYYYMMDDTHHMMSSZ` is a UTC second and selects
+the version a listing shows under that name: the first kept version within
+that second (later ones in the same second are listed as `….1`, `….2` and
+reached through the listing), or for a second with none, the latest version
+before it ends. Both are canonical-only, like every spec (DECISIONS 7).
 
 ## 53. Gzip-compressed tar
 

@@ -628,11 +628,29 @@ fn write(ctx: &Ctx, arg: &OsStr, bytes: &[u8]) -> Result<(), Failure> {
     let Some(last) = names.pop() else {
         return Err(Failure::new("can't write the root", exit::USAGE));
     };
+    let read_only = || Error::ReadOnly {
+        path: arg.to_string_lossy().into_owned(),
+    };
     let parent = f
         .resolve_names(names.iter().map(OsString::as_os_str))
-        .map_err(|e| failure(&e, arg))?;
+        .map_err(|e| {
+            // Under a time lens that finds nothing, the write is still a
+            // write to the past.
+            let past = names.iter().any(|n| {
+                n.to_str()
+                    .is_some_and(|t| fernet_fs_path::Component::parse(t).when.is_some())
+            });
+            if past && matches!(e, Error::NotFound { .. }) {
+                failure(&read_only(), arg)
+            } else {
+                failure(&e, arg)
+            }
+        })?;
     let target = f.lookup(&parent, &last).map_err(|e| failure(&e, arg))?;
     let res = match (&target, &parent) {
+        // Anything under a time lens is read-only, found or not.
+        (_, p) if p.is_past() => Err(read_only()),
+        (r, _) if r.is_past() => Err(read_only()),
         (
             Resolved::Inside {
                 node: fernet_fs_core::NodeKind::Scalar(_),
@@ -651,18 +669,21 @@ fn write(ctx: &Ctx, arg: &OsStr, bytes: &[u8]) -> Result<(), Failure> {
             )
         }
         (Resolved::Missing, Resolved::RealDir { path }) => {
-            let path = path.join(&last);
-            std::fs::write(&path, bytes).map_err(|e| {
-                Failure::new(
-                    format!("{}: {e}", path.display()).to_lowercase(),
-                    exit::INTERNAL,
-                )
-            })?;
-            f.snapshot(&path).map(|_| ()).or(Ok(()))
+            // A name that parses with a lens names something that isn't
+            // there (`notes.txt@~9`, `notes.txt#`); it never becomes a file.
+            let lens = last
+                .to_str()
+                .map(fernet_fs_path::Component::parse)
+                .filter(|c| c.when.is_some() || c.open);
+            match lens {
+                Some(c) if c.when.is_some() => Err(read_only()),
+                Some(_) => Err(Error::Unsupported {
+                    path: arg.to_string_lossy().into_owned(),
+                    message: "# opens an existing structured file; there is none here".into(),
+                }),
+                None => f.create_file(path, &last, bytes),
+            }
         }
-        (r, _) if r.is_past() => Err(Error::ReadOnly {
-            path: arg.to_string_lossy().into_owned(),
-        }),
         (Resolved::Missing, _) => Err(Error::NotFound {
             parent: String::new(),
             name: arg.to_string_lossy().into_owned(),
